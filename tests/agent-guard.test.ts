@@ -1340,6 +1340,43 @@ test('slow mail checks keep only their own emails private while the model still 
   );
 });
 
+test('five mail check timeouts in a row do not stop a read whose sixth check is answered', async (t) => {
+  const timers: AbortController[] = [];
+  t.mock.method(AbortSignal, 'timeout', () => {
+    const controller = new AbortController();
+    timers.push(controller);
+    return controller.signal;
+  });
+  const pending: Array<() => void> = [];
+  const check = createMailCheck({
+    curator: {
+      id: 'fixture',
+      configured: true,
+      curate: () => new Promise((resolve) => pending.push(() => resolve({ access: false }))),
+    },
+  });
+  const result = check(
+    Array.from({ length: 12 }, () => ({
+      from: 'fixture@example.test',
+      subject: 'Receipt',
+      text: 'Synthetic receipt',
+    })),
+  );
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  await settle();
+  pending.splice(0, 5);
+  for (const timer of timers.slice(0, 5))
+    timer.abort(new DOMException('Synthetic timeout', 'TimeoutError'));
+  for (let tick = 0; tick < 20; tick++) {
+    await settle();
+    pending.splice(0).forEach((finish) => finish());
+  }
+  assert.deepEqual(await result, [
+    ...Array<string>(5).fill('the check model did not answer within 15 seconds'),
+    ...Array<boolean>(7).fill(false),
+  ]);
+});
+
 test('mail check timeouts in every slot stop the rest of the read without waiting for an unresponsive provider', async (t) => {
   const timeout = new AbortController();
   let timers = 0;
