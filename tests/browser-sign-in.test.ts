@@ -851,7 +851,11 @@ test(
           ]);
         if (path === '/foreign') {
           await assert.rejects(inspect());
-          await assert.rejects(inspectRef());
+          await assert.rejects(
+            inspectRef(),
+            (error) =>
+              error instanceof BrowserActionError && error.code === 'browser_target_changed',
+          );
           continue;
         }
         assert.equal((await inspectRef()).methods[0]!.label, 'Continue with Example');
