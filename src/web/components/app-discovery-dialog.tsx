@@ -570,7 +570,13 @@ export function AppDiscoveryDialog({
               </Field>
               <details className="app-discovery-methods">
                 <summary>Use an access token instead</summary>
-                <Field label="MCP access token">
+                <Field
+                  label="MCP access token"
+                  hint={
+                    discovery.service === 'n8n' &&
+                    'Copy this token from Settings → Instance-level MCP in your n8n instance.'
+                  }
+                >
                   <Input
                     name="token"
                     type="password"
