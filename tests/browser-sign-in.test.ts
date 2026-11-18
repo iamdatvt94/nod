@@ -702,7 +702,7 @@ test(
       response.end(
         `
         ${request.url === '/scaled-inner' ? '<script>addEventListener("pointermove",()=>{const xhr=new XMLHttpRequest();xhr.open("POST","/moved",false);xhr.send()},{once:true})</script>' : ''}
-        <base href="/"><form action="selected" method="post">${primary}<button id="alternate" formaction="/alternate">Use another account</button></form><a id="link" href="linked">Continue with Link</a><button id="change" onclick="${change}">Change control</button>`,
+        <base href="/"><style>#primary{position:relative}#primary::after{content:"";position:absolute;inset:0}</style><form action="selected" method="post">${primary}<button id="alternate" formaction="/alternate">Use another account</button></form><a id="link" href="linked">Continue with Link</a><button id="change" onclick="${change}">Change control</button>`,
       );
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -826,10 +826,20 @@ test(
         await act({ action: 'wait', text: 'Frame ready' });
         const inspect = () =>
           client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]);
+        const framedRef = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
+          (await act({ action: 'snapshot' })).text,
+        )?.[1];
+        assert.ok(framedRef);
+        const inspectRef = () =>
+          client.signInMethods!('fixture', origin, [
+            { label: 'Ignored', selector: '@' + framedRef },
+          ]);
         if (path === '/foreign') {
           await assert.rejects(inspect());
+          await assert.rejects(inspectRef());
           continue;
         }
+        assert.equal((await inspectRef()).methods[0]!.label, 'Continue with Example');
         const framed = await inspect();
         assert.equal(framed.methods[0]!.label, 'Continue with Example');
         await act({ action: 'click', selector: '#reload-frame' });

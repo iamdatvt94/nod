@@ -1682,7 +1682,10 @@ export function createAgentBrowserComputer(options: {
       .object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() })
       .passthrough()
       .parse(await command(state, { action: 'boundingbox', selector: `@${ref}` }));
-    return { pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 } };
+    return {
+      pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+      control: state.refs.get(ref),
+    };
   }
 
   async function submissionOf(
