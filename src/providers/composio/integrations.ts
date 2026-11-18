@@ -617,6 +617,29 @@ export function createComposioProvider(options: {
           );
         }
       },
+      async offers(action, signal) {
+        actionToolkit(action);
+        const response = await client.getClient().toolRouter.session.executeMeta(
+          value.sessionId,
+          {
+            slug: 'COMPOSIO_GET_TOOL_SCHEMAS',
+            arguments: { tool_slugs: [action], include: ['input_schema'] },
+          },
+          { signal },
+        );
+        signal?.throwIfAborted();
+        const missing = z.object({ not_found: z.array(z.string()).optional() });
+        const answer = z
+          .object({ data: missing.extend({ data: missing.optional() }) })
+          .safeParse(response);
+        return !(
+          answer.success &&
+          [
+            ...(answer.data.data.not_found ?? []),
+            ...(answer.data.data.data?.not_found ?? []),
+          ].includes(action)
+        );
+      },
       async execute(action, args, accountId, signal) {
         signal?.throwIfAborted();
         const toolkit = actionToolkit(action);

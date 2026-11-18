@@ -7572,6 +7572,47 @@ test(
 );
 
 test(
+  'an action the connection service does not offer is refused before any app request',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    await f.connect('slack');
+    f.sessions.length = 0;
+    let offered: boolean | Error = false;
+    f.session.offers = async () => {
+      if (offered instanceof Error) throw offered;
+      return offered;
+    };
+    await assert.rejects(
+      f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE'),
+      (error: Error & { statusCode?: number }) => {
+        assert.equal(error.statusCode, 404);
+        assert.ok(error.message.includes('SLACK_POST_MESSAGE'));
+        return true;
+      },
+    );
+    assert.equal(f.sessions.length, 1);
+    assert.equal(f.executed.length, 0);
+    offered = new Error('lookup unavailable');
+    await f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE');
+    offered = true;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    offered = false;
+    const lookups = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    t.mock.method(f.session, 'search', async () => ({
+      tools: { SLACK_FIND_CHANNELS: {} },
+      suggestions: [],
+    }));
+    await f.service.execute('local-development', 'SEARCH_TOOLS', { query: 'find channels' });
+    const searched = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_FIND_CHANNELS');
+    assert.equal(lookups, 3);
+    assert.equal(f.sessions.length, searched);
+  },
+);
+
+test(
   'ordinary account-scoped discovery excludes other accounts from the provider session',
   { skip: !process.env.TEST_DATABASE_URL },
   async (t) => {
@@ -11298,6 +11339,22 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
       (error: unknown) => error === requestError,
     );
   }
+  const lookup = t.mock.method(client.getClient().toolRouter.session, 'executeMeta', async () => ({
+    error: null,
+    data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] },
+  }));
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  assert.equal(await session.offers!('GMAIL_SEND_EMAIL'), true);
+  lookup.mock.mockImplementation(
+    async () =>
+      ({
+        error: null,
+        data: { data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] } },
+      }) as never,
+  );
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  lookup.mock.mockImplementation(async () => ({ error: 'unexpected', data: {} }) as never);
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), true);
   requestError = APIError.generate(
     404,
     { error: 'not_found' },

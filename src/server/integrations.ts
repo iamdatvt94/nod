@@ -1536,6 +1536,43 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     return slug;
   }
 
+  const offeredActions = new Set<string>();
+  async function assertOffered(ownerId: string, action: string, signal?: AbortSignal) {
+    assertOwner(ownerId);
+    if (offeredActions.has(action) || !provider.configured || provider.connectionBackoff?.())
+      return;
+    let offered: boolean;
+    try {
+      const rows = await connectionRows(ownerId);
+      const slug = matchingService(action, knownServices(rows));
+      const row = rows.find(
+        (candidate) =>
+          candidate.slug === slug &&
+          candidate.account_id &&
+          !candidate.revoked &&
+          candidate.account_active &&
+          configurationMatches(candidate),
+      );
+      if (!slug || slug === retiredNotionMcp || directApps.has(slug) || !row) return;
+      const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(15_000)]);
+      offered = await withAccountSession(
+        ownerId,
+        [row],
+        bounded,
+        async (session) => (await session.offers?.(action, bounded)) ?? true,
+      );
+    } catch {
+      signal?.throwIfAborted();
+      return;
+    }
+    if (!offered)
+      throw new IntegrationError(
+        `${action} is not an action the connection service offers, so no app request was sent. Find the exact action name with SEARCH_TOOLS.`,
+        404,
+      );
+    offeredActions.add(action);
+  }
+
   async function selectedConnection(
     ownerId: string,
     action: string,
@@ -1710,6 +1747,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               signal?.throwIfAborted();
               return session.search(query, signal);
             });
+            for (const action of Object.keys(found.tools as Record<string, unknown>))
+              offeredActions.add(action);
             tools = Object.fromEntries(
               Object.entries(found.tools as Record<string, unknown>).filter(([action]) => {
                 const slug = matchingService(action, services);
@@ -2954,6 +2993,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     readActivity,
     watchable,
     watchState,
+    assertOffered,
     execute,
     executeApproved,
     serviceWait,

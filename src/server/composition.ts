@@ -2708,6 +2708,7 @@ async function initializeApplication(
             },
           });
         }
+        await integrations.assertOffered(ownerId, action, options.signal);
         const prepare = () =>
           hasWorkspaceFiles(args)
             ? withTurnLock(turn.turnId, (client) =>
