@@ -151,6 +151,10 @@ A sign-in link expires after 10 minutes. The diagnostic report then records the 
 
 If an app tool error shows `HTTP 403` and a UTC time, [report a bug with a diagnostic report](/deploy/troubleshooting/#report-a-bug-with-a-diagnostic-report). Include that time and any Cloudflare Ray ID in your feedback text. The displayed `0x` is a formatting prefix; support removes it before searching Cloudflare.
 
+### An app tool fails with HTTP 404
+
+If an app tool error says the connection service answered an action with `HTTP 404`, the service did not find something in that request. The usual cause is an action name the app doesn't offer, which happens when Nod calls an action without looking it up first. Ask Nod to search the app's tools for the exact action and try again. If an action found that way still returns `HTTP 404`, [report a bug with a diagnostic report](/deploy/troubleshooting/#report-a-bug-with-a-diagnostic-report).
+
 ### The connection service refused this request
 
 When the connection service refuses a file for an app, the error shows its HTTP status, and its reason when Nod recognizes it. For example: `The connection service refused this request: file_verification_failed. HTTP 502.` The app action doesn't run, so nothing reaches the recipient.

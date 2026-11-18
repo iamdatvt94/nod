@@ -641,6 +641,13 @@ export function createComposioProvider(options: {
                 { status: 403 },
               );
             }
+            if (error instanceof APIError && error.status === 404)
+              throw Object.assign(
+                new Error(
+                  `The connection service answered ${action} with HTTP ${error.message}. If this action name did not come from SEARCH_TOOLS, find the exact name there before calling it again.`,
+                ),
+                { status: 404 },
+              );
             const kind = error instanceof Error ? error.constructor.name : '';
             const reason =
               kind === 'APIConnectionTimeoutError'

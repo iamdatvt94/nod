@@ -11298,6 +11298,22 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
       (error: unknown) => error === requestError,
     );
   }
+  requestError = APIError.generate(
+    404,
+    { error: 'not_found' },
+    undefined,
+    new Headers({ 'content-type': 'application/json' }),
+  );
+  await assert.rejects(
+    session.execute('GMAIL_GET_MESSAGE', {}, 'fixture-account'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as Error & { status?: number }).status, 404);
+      assert.ok(error.message.includes('GMAIL_GET_MESSAGE'));
+      assert.match(error.message, /HTTP 404.*not_found/);
+      return true;
+    },
+  );
 });
 
 test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
