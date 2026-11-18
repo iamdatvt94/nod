@@ -1682,9 +1682,13 @@ export function createAgentBrowserComputer(options: {
       .object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() })
       .passthrough()
       .parse(await command(state, { action: 'boundingbox', selector: `@${ref}` }));
+    const control = state.refs.get(ref);
+    const same = [...state.refs.values()].filter(
+      (item) => item.role === control?.role && item.name === control.name,
+    );
     return {
       pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
-      control: state.refs.get(ref),
+      ...(same.length === 1 ? { control } : {}),
     };
   }
 

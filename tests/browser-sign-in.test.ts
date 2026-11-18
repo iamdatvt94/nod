@@ -688,6 +688,12 @@ test(
         );
         return;
       }
+      if (request.url === '/twin' || request.url === '/twin-inner') {
+        response.end(
+          `<body style="margin:8px"><form action="/selected" method="post" style="margin:0"><button style="width:200px;height:40px">Continue with Example</button></form>${request.url === '/twin' ? '<div style="position:fixed;left:0;top:0;width:300px;height:60px"></div><iframe title="Sign in" src="/twin-inner" style="width:500px;height:300px;margin:150px 200px;border:0"></iframe>' : ''}`,
+        );
+        return;
+      }
       if (request.url === '/cancel') {
         response.end(
           '<form action="/selected" method="post"><button id="primary" onmousedown="const xhr=new XMLHttpRequest();xhr.open(\'POST\',\'/pressed\',false);xhr.send()">Continue with Example</button></form><button id="ordinary" onclick="if(event.isTrusted)fetch(\'/ordinary\',{method:\'POST\'})">Continue browsing</button>',
@@ -820,6 +826,15 @@ test(
       await act({ action: 'open', url: origin + '/duplicate' });
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]),
+      );
+      await act({ action: 'open', url: origin + '/twin' });
+      await act({ action: 'wait', load: 'networkidle' });
+      const twin = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
+        (await act({ action: 'snapshot' })).text,
+      )?.[1];
+      assert.ok(twin);
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@' + twin }]),
       );
       for (const path of ['/framed', '/foreign']) {
         await act({ action: 'open', url: origin + path });
