@@ -673,7 +673,9 @@ export function createPiAgent(options: {
       const compactTools = [
         ...sandboxTools.map((tool) => tool.name),
         'nod_tool_search',
-        ...(input.tools.some((tool) => tool.name === 'apps') ? ['apps'] : []),
+        ...['apps', 'send_message'].filter((name) =>
+          input.tools.some((tool) => tool.name === name),
+        ),
       ];
       const tools: ToolDefinition[] = [
         ...sandboxTools.map((definition): ToolDefinition => ({
