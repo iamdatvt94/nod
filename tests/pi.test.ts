@@ -270,7 +270,7 @@ test('models and routers complete tool discovery inside the endpoint context', a
           );
           assert.ok(
             body.tools.some((tool: any) => tool.function.name === 'send_message'),
-            'A background run cannot deliver its result without the send_message tool.',
+            'Results cannot be delivered without the send_message tool.',
           );
         }
         const call = summarizing ? undefined : calls[requests++];
