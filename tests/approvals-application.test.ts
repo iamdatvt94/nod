@@ -1028,9 +1028,7 @@ test(
             action: 'GMAIL_SEND_MESSAGE',
             args: { recipient_email: 'collector@example.test' },
           });
-          const response = await request('POST', '/api/messages', { text });
-          const refused = response.json().turnId as string;
-          ids.push(response.json().threadId as string);
+          const refused = (await submitUserMessage(text)).turnId;
           await waitFor(refused, 'failed|succeeded|waiting').finally(() => {
             unoffered = undefined;
           });
