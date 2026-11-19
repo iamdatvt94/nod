@@ -356,12 +356,28 @@ export function createLedger({
     FROM (VALUES($3::uuid)) u(id) LEFT JOIN turns t ON t.id=u.id
     WHERE t.id IS NULL OR t.owner_id=$2
     ON CONFLICT(id) DO NOTHING`;
-  const pendingUsage = new Map<string, { values: unknown[]; pending: Promise<void> }>();
+  const pendingUsage = new Map<
+    string,
+    {
+      values: unknown[];
+      pending: Promise<void>;
+      scope: ReturnType<typeof preparation.getStore>;
+      saved(): Promise<void>;
+    }
+  >();
   async function flushUsage() {
     await Promise.all([...pendingUsage.values()].map(({ pending }) => pending));
-    for (const [id, { values }] of pendingUsage) {
+    for (const { values, saved } of pendingUsage.values()) {
       await pool.query(usageSql, values);
-      pendingUsage.delete(id);
+      await saved();
+    }
+  }
+
+  async function finishUsage() {
+    try {
+      await flushUsage();
+    } catch (error) {
+      logFailure('ledger_usage_failed', error);
     }
   }
 
@@ -370,8 +386,8 @@ export function createLedger({
     execution: ExecutionScope | null | undefined = activeExecution.getStore(),
   ) {
     const { id, costUsd, turnId, ...details } = usage;
-    if (preparation.getStore())
-      Object.assign(details, { preparation: true, preparationId: preparation.getStore()!.id });
+    const scope = preparation.getStore();
+    if (scope) Object.assign(details, { preparation: true, preparationId: scope.id });
     const attributedTurn =
       execution === null
         ? null
@@ -388,15 +404,14 @@ export function createLedger({
       execution?.browserId ?? null,
       JSON.stringify(details),
     ];
-    const pending = pool.query(usageSql, values).then(
-      async () => {
-        pendingUsage.delete(id);
-        const scope = preparation.getStore();
-        if (scope?.closed) await releasePreparation(scope.id);
-      },
-      (error) => logFailure('ledger_usage_failed', error, { turnId: attributedTurn }),
-    );
-    pendingUsage.set(id, { values, pending });
+    const saved = async () => {
+      pendingUsage.delete(id);
+      if (scope?.closed) await releasePreparation(scope.id);
+    };
+    const pending = pool
+      .query(usageSql, values)
+      .then(saved, (error) => logFailure('ledger_usage_failed', error, { turnId: attributedTurn }));
+    pendingUsage.set(id, { values, pending, scope, saved });
     analytics?.(modelUsed(usage, execution));
     telemetry?.record({ ...usage, turnId: attributedTurn ?? undefined });
   }
@@ -428,12 +443,12 @@ export function createLedger({
 
   async function reserve(maximum: number | null | (() => number | null)) {
     const scope = preparation.getStore();
+    if (scope?.closed) throw new Error('This automatic preparation has stopped.');
+    await flushUsage();
     if (!scope) return async () => {};
-    if (scope.closed) throw new Error('This automatic preparation has stopped.');
     const maximumUsd = typeof maximum === 'function' ? maximum() : maximum;
     if (maximumUsd === null || !Number.isFinite(maximumUsd) || maximumUsd < 0)
       throw new Error('Automatic preparation stopped because this model has no cost estimate.');
-    await flushUsage();
     let month: Date | undefined;
     await transaction(async (client) => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
@@ -493,6 +508,7 @@ export function createLedger({
   }
 
   async function releasePreparation(id: string) {
+    if ([...pendingUsage.values()].some((entry) => entry.scope?.id === id)) return;
     await pool
       .query(
         `DELETE FROM preparation_reservations r WHERE r.owner_id=$1 AND r.id=$2
@@ -511,11 +527,8 @@ export function createLedger({
         return await run();
       } finally {
         scope.closed = true;
-        try {
-          await flushUsage();
-        } finally {
-          await releasePreparation(id);
-        }
+        await finishUsage();
+        await releasePreparation(id);
       }
     });
   }
@@ -551,14 +564,28 @@ export function createLedger({
             session.onEvent(event);
           },
         });
+        let interruption = 0;
         return {
           ...opened,
+          abort() {
+            interruption++;
+            return opened.abort();
+          },
+          dispose() {
+            interruption++;
+            return opened.dispose();
+          },
           async prompt(...args) {
+            const version = interruption;
+            const limited = await limitReached();
+            if (version !== interruption)
+              throw new DOMException('The model request was stopped.', 'AbortError');
+            if (limited) throw new Error(spendingLimitReached);
             attempt = 1;
             try {
               await activeExecution.run(session, () => opened.prompt(...args));
             } finally {
-              await flushUsage();
+              await finishUsage();
             }
           },
         };
@@ -606,7 +633,7 @@ export function createLedger({
             report?.(value);
           });
         } finally {
-          await flushUsage();
+          await finishUsage();
         }
       },
     };
@@ -627,7 +654,7 @@ export function createLedger({
           report?.(usage);
         });
       } finally {
-        await flushUsage();
+        await finishUsage();
       }
     }
     return {
@@ -701,19 +728,20 @@ export function createLedger({
             options,
           );
         } finally {
-          await flushUsage();
+          await finishUsage();
         }
       },
       ...(base.transcribe
         ? ({
             async transcribe(audio, signal, onUsage) {
+              await flushUsage();
               try {
                 return await base.transcribe!(audio, signal, (usage) => {
                   report(usage, true);
                   onUsage?.(usage);
                 });
               } finally {
-                await flushUsage();
+                await finishUsage();
               }
             },
           } satisfies Pick<SpeechProvider, 'transcribe'>)
@@ -751,7 +779,11 @@ export function createLedger({
   }
 
   async function limitReached() {
-    return !pastLimit.getStore() && Boolean(await reachedLimit());
+    if (pastLimit.getStore()) {
+      await flushUsage();
+      return false;
+    }
+    return Boolean(await reachedLimit());
   }
 
   async function checkIn(sessionId: string, turnId: string) {

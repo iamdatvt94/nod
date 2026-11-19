@@ -12,7 +12,7 @@ import type {
   ScheduleRun,
   TurnStatus,
 } from '../shared/contracts.ts';
-import type { enqueueTurn } from './thread.ts';
+import { abortTurns, cancelTurns, lockThread, type enqueueTurn } from './thread.ts';
 import { modelSelectionInput } from './models.ts';
 import {
   repriceUsd,
@@ -23,7 +23,7 @@ import {
 import { activeThreadSql } from './history.ts';
 import { waitingTurnSql } from './turn-chain.ts';
 import type { WorkConsumers } from './work-admission.ts';
-import type { CaptureAnalytics } from './analytics.ts';
+import { snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { logFailure } from './failure-log.ts';
 import { lockKey } from './locks.ts';
 import {
@@ -37,6 +37,13 @@ import {
 const queue = 'scheduled-task';
 const lateAfterMs = 10 * 60_000;
 const skippedCountLimit = 100;
+const runTurn = `JOIN LATERAL (
+  SELECT u.* FROM turns u WHERE u.owner_id=r.owner_id AND (u.id=r.turn_id OR u.session_id=r.turn_id)
+    AND (u.id=r.turn_id OR NOT (u.status='succeeded' AND u.started_at IS NULL
+      AND u.message_id IS NOT NULL AND u.source IN ('user','task')))
+  ORDER BY CASE WHEN u.status='running' THEN 0 WHEN u.status='queued' THEN 1
+    WHEN ${waitingTurnSql('u')} THEN 2 ELSE 3 END,u.created_at DESC,u.id DESC LIMIT 1
+) u ON true`;
 const timingSchema = z.object({
   kind: z.enum(['once', 'recurring']).default('recurring'),
   cron: z.string().trim().min(1).nullable().optional(),
@@ -100,6 +107,7 @@ export interface ScheduleDependencies {
   stopConsumer?: (id: string) => Promise<void>;
   enqueueTurn: typeof enqueueTurn;
   refresh(): void;
+  clearBrowser?(id: string): Promise<void>;
   retireScheduleConfirmations?(client: PoolClient, id: string, waitForSend: boolean): Promise<void>;
   now?: () => Date;
   sessionCosts?(sessionIds: string[]): Promise<Record<string, number | null>>;
@@ -446,6 +454,29 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     return { ...run, activeRun: await activeRun(pool, id) };
   }
 
+  async function stopRun(id: string, turnId: string) {
+    z.uuid().parse(id);
+    z.uuid().parse(turnId);
+    const capture = snapshotAnalytics(dependencies.analytics);
+    const cancelled = await cancellationTransaction(async (client) => {
+      const thread = await lockThread(client, ownerId);
+      const run = (
+        await client.query<{ sessionId: string }>(
+          `SELECT r.turn_id AS "sessionId" FROM schedule_runs r
+           JOIN turns u ON u.session_id=r.turn_id AND u.owner_id=r.owner_id
+           WHERE r.owner_id=$1 AND r.schedule_id=$2 AND u.id=$3 AND u.thread_id=$4`,
+          [ownerId, id, turnId, thread.id],
+        )
+      ).rows[0];
+      if (!run) throw Object.assign(new Error('Schedule run not found.'), { statusCode: 404 });
+      return cancelTurns(client, thread.id, { sessionId: run.sessionId }, capture, 'owner');
+    }, pool);
+    abortTurns(cancelled.ids);
+    await Promise.allSettled(cancelled.browsers.map((id) => dependencies.clearBrowser?.(id)));
+    refresh();
+    return { ok: true };
+  }
+
   async function dispatch(job: Job<ScheduleJob>) {
     job.signal.throwIfAborted();
     const watched = (
@@ -509,8 +540,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           row.watchMarker === unchanged &&
           (
             await client.query<{ status: TurnStatus }>(
-              `SELECT u.status FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
-               WHERE r.owner_id=$1 AND r.schedule_id=$2 ORDER BY r.scheduled_for DESC LIMIT 1`,
+              `SELECT u.status FROM schedule_runs r ${runTurn}
+               WHERE r.owner_id=$1 AND r.schedule_id=$2 ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC LIMIT 1`,
               [ownerId, row.id],
             )
           ).rows[0]?.status === 'succeeded'
@@ -636,7 +667,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
            r.scheduled_for AS "scheduledFor",r.time_zone AS "timeZone",r.created_at AS "createdAt",
            u.status,u.error,r.observation,r.observed_at AS "observedAt",m.id AS "messageId",m.text AS "messageText",
            to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "cursorAt"
-         FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+         FROM schedule_runs r ${runTurn}
          LEFT JOIN LATERAL (
            SELECT m.id,left(m.text,4000) AS text FROM messages m
            WHERE m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='assistant'
@@ -733,9 +764,9 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       await pool.query<{ schedule_id: string; turn_id: string; latest: boolean }>(
         `SELECT schedule_id,turn_id,latest FROM (
            SELECT r.schedule_id,r.turn_id,
-             row_number() OVER (PARTITION BY r.schedule_id ORDER BY r.scheduled_for DESC) AS recent,
-             row_number() OVER (ORDER BY r.scheduled_for DESC)<=10 AS latest
-           FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+             row_number() OVER (PARTITION BY r.schedule_id ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC) AS recent,
+             row_number() OVER (ORDER BY r.scheduled_for DESC,r.created_at DESC,r.id DESC)<=10 AS latest
+           FROM schedule_runs r ${runTurn}
            WHERE r.owner_id=$2 AND u.status NOT IN ('queued','running','waiting')) runs
          WHERE (recent<=10 AND schedule_id=ANY($1::uuid[])) OR latest`,
         [recurring.map((row) => row.id), ownerId],
@@ -1270,6 +1301,10 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     app.get('/api/schedules', list);
     app.post<{ Params: { id: string } }>('/api/schedules/:id/run', (request) =>
       runNow(request.params.id, request.body),
+    );
+    app.post<{ Params: { id: string; turnId: string } }>(
+      '/api/schedules/:id/runs/:turnId/stop',
+      (request) => stopRun(request.params.id, request.params.turnId),
     );
     app.post<{ Params: { id: string } }>('/api/schedules/:id/preview', async (request) => {
       const previous = await read(z.uuid().parse(request.params.id));

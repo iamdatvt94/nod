@@ -135,6 +135,7 @@ export interface RuntimeContext {
   account?: RuntimeAccount;
   connectedApps?: ConnectedApp[];
   localFiles?: boolean;
+  computerUse?: boolean;
   mcpServers?: ConnectedMcpServer[];
   currentMessageId?: string;
   automatic?: boolean;
@@ -173,7 +174,7 @@ export interface RuntimeContext {
   withdrawnRequest?: 'stopped' | 'failed';
   confirmedActions?: string[];
   credentialRequests?: Array<
-    Pick<CredentialRequest, 'turnId' | 'origin' | 'label' | 'kind' | 'status'>
+    Pick<CredentialRequest, 'turnId' | 'origin' | 'label' | 'kind' | 'status' | 'notEntered'>
   >;
   taskContext?: {
     id: string;
@@ -256,6 +257,10 @@ export interface RuntimeContext {
     ),
   ): Promise<{ url: string } | { filled: true } | { [appConfirmation]: string }>;
   requestPayment?(input: unknown): Promise<{ question: string; action: string; url?: string }>;
+  checkWorkspaceCommand?(
+    input: { command: string; cwd: string; timeoutSeconds: number },
+    signal: AbortSignal,
+  ): Promise<{ signal?: AbortSignal; record(): Promise<void> }>;
   integration(
     action: string,
     args: Record<string, unknown>,
@@ -376,7 +381,7 @@ export interface AgentSessionOptions extends ExecutionScope {
   runTool(
     name: string,
     params: unknown,
-    run: () => Promise<AgentToolResult>,
+    run: (signal?: AbortSignal) => Promise<AgentToolResult>,
     options?: { nested?: boolean },
   ): Promise<AgentToolResult>;
   onEvent(event: AgentEvent): void;

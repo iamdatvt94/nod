@@ -1136,10 +1136,10 @@ export async function createDiscoveredConnections(
       settled: boolean;
     }
   >();
-  async function signInRequired(id: string, required: boolean) {
+  async function signInRequired(row: AccountRow, required: boolean) {
     const changed = await pool.query(
-      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3',
-      [id, owner, required],
+      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3 AND account_id=$4 AND paths=$5::jsonb',
+      [row.id, owner, required, row.account_id, JSON.stringify(row.paths)],
     );
     if (changed.rowCount) options.refresh?.();
   }
@@ -1154,17 +1154,48 @@ export async function createDiscoveredConnections(
     allowStale = false,
   ): Promise<DiscoveredCatalog> {
     signal?.throwIfAborted();
-    const key = `${row.id}:${path.id}:${row.account_id}`;
+    const key = JSON.stringify([row.id, row.account_id, path]);
     const cached = catalogs.get(key);
     if (cached && Date.now() - cached.at < catalogMs)
       return allowStale && cached.ready ? cached.ready : cached.value;
     const value = (async () => {
+      await assertBinding(row);
+      signal?.throwIfAborted();
       const token = await tokenFor(row, path, signal);
-      const { tools, instructions } = await via(path).transport.listTools(
-        path.endpoint,
-        headers(path, token),
-        signal,
-      );
+      await assertBinding(row);
+      signal?.throwIfAborted();
+      const { tools, instructions } = await via(path)
+        .transport.listTools(path.endpoint, headers(path, token), signal)
+        .catch((cause: unknown) => {
+          signal?.throwIfAborted();
+          const fields =
+            cause && typeof cause === 'object' ? (cause as Record<string, unknown>) : {};
+          const status = [fields.status, fields.statusCode].find(
+            (value) =>
+              typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599,
+          );
+          const code =
+            (typeof fields.code === 'number' && Number.isFinite(fields.code)) ||
+            typeof fields.code === 'string'
+              ? String(redact(String(fields.code), token)).slice(0, 100)
+              : undefined;
+          const detail = [
+            status === undefined ? undefined : `status ${status}`,
+            code === undefined ? undefined : `code ${code}`,
+          ]
+            .filter(Boolean)
+            .join('; ');
+          throw Object.assign(
+            error(
+              `The connected MCP tool list failed${detail ? ` (${detail})` : ''}: ${String(redact(cause instanceof Error ? cause.message : String(cause), token)).slice(0, 4000)}`,
+              502,
+            ),
+            { notRun: true, ...(status === undefined ? {} : { upstreamStatus: status }) },
+          );
+        });
+      signal?.throwIfAborted();
+      await assertBinding(row);
+      signal?.throwIfAborted();
       return {
         tools: tools.map((tool) => redact(tool, token) as DiscoveredTool),
         ...(instructions
@@ -1180,12 +1211,12 @@ export async function createDiscoveredConnections(
       },
       () => {
         if (catalogs.get(key) !== entry) return;
-        if (cached) catalogs.set(key, { ...cached, at: Date.now() });
+        if (cached) catalogs.set(key, cached);
         else catalogs.delete(key);
       },
     );
     if (allowStale && entry.ready) return entry.ready;
-    return cached ? value.catch(() => cached.value) : value;
+    return cached && allowStale ? value.catch(() => cached.value) : value;
   }
   async function tokenFor(
     row: AccountRow,
@@ -1193,50 +1224,69 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
   ): Promise<string> {
     signal?.throwIfAborted();
-    const grant = await options.grantVault.read(row.id);
+    const readGrant = () =>
+      transaction(
+        async (client) => {
+          await assertBinding(row, undefined, client);
+          return options.grantVault.read(row.id, client);
+        },
+        pool,
+        signal,
+      );
+    const grant = await readGrant();
     signal?.throwIfAborted();
     const secret = grant.value;
     if (path.auth !== 'oauth') return secret;
     const saved = JSON.parse(secret) as DiscoveredOAuthState;
     if (!saved.tokens?.access_token) {
-      await signInRequired(row.id, true);
+      await signInRequired(row, true);
       throw Object.assign(error('Connect this account again.', 409), { reason: 'authentication' });
     }
     if (!saved.expiresAt || saved.expiresAt > Date.now() + 60_000) return saved.tokens.access_token;
-    let current = refreshes.get(row.id);
+    const refreshKey = JSON.stringify([row.id, row.account_id, row.paths]);
+    let current = refreshes.get(refreshKey);
     if (!current || current.controller.signal.aborted) {
       const controller = new AbortController();
       const pending = (async () => {
+        await assertBinding(row);
+        controller.signal.throwIfAborted();
         const next = await via(path)
           .oauth.refresh(path.endpoint, saved, controller.signal)
           .catch(async (cause: unknown) => {
-            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row.id, true);
+            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row, true);
             throw cause;
           });
         if (!next.tokens?.access_token) throw new Error();
-        const changed = await options.grantVault.replace(
-          row.id,
-          grant.version,
-          JSON.stringify(next),
+        const token = await transaction(
+          async (client) => {
+            await assertBinding(row, undefined, client);
+            const changed = await options.grantVault.replace(
+              row.id,
+              grant.version,
+              JSON.stringify(next),
+              client,
+            );
+            if (changed) return next.tokens!.access_token!;
+            const latest = JSON.parse(
+              (await options.grantVault.read(row.id, client)).value,
+            ) as DiscoveredOAuthState;
+            if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
+              throw new Error();
+            return latest.tokens.access_token;
+          },
+          pool,
+          controller.signal,
         );
-        let token = next.tokens.access_token;
-        if (!changed) {
-          const latest = JSON.parse(
-            (await options.grantVault.read(row.id)).value,
-          ) as DiscoveredOAuthState;
-          if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
-            throw new Error();
-          token = latest.tokens.access_token;
-        }
-        await signInRequired(row.id, false);
+        await assertBinding(row);
+        await signInRequired(row, false);
         return token;
       })();
       const created = { promise: pending, controller, waiters: 0, settled: false };
-      refreshes.set(row.id, created);
+      refreshes.set(refreshKey, created);
       void pending
         .finally(() => {
           created.settled = true;
-          if (refreshes.get(row.id) === created) refreshes.delete(row.id);
+          if (refreshes.get(refreshKey) === created) refreshes.delete(refreshKey);
         })
         .catch(() => {});
       current = created;
@@ -1260,12 +1310,14 @@ export async function createDiscoveredConnections(
         (cause: unknown) =>
           finish(() =>
             reject(
-              Object.assign(error('Connect this account again.', 409), {
-                reason:
-                  cause instanceof DiscoveredSignInRequired
-                    ? 'authentication'
-                    : serviceFailureReason(cause),
-              }),
+              cause instanceof DiscoveredConnectionError && 'notRun' in cause
+                ? cause
+                : Object.assign(error('Connect this account again.', 409), {
+                    reason:
+                      cause instanceof DiscoveredSignInRequired
+                        ? 'authentication'
+                        : serviceFailureReason(cause),
+                  }),
             ),
           ),
       );
@@ -1518,6 +1570,54 @@ export async function createDiscoveredConnections(
     ).rows[0];
     return row ? JSON.stringify([row.account_id, row.paths]) : undefined;
   }
+  async function assertBinding(
+    row: AccountRow,
+    expectedBinding = JSON.stringify([row.account_id, row.paths]),
+    client?: PoolClient,
+  ) {
+    const current = await binding(row.id, client);
+    if (current !== JSON.stringify([row.account_id, row.paths]) || current !== expectedBinding)
+      throw Object.assign(error('This connected account changed.', 409), { notRun: true });
+  }
+  async function approvalDetails(
+    action: 'CONNECTED_HTTP' | 'CONNECTED_MCP_CALL',
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) {
+    args = structuredClone(args);
+    signal?.throwIfAborted();
+    const { row, call } = await selected(action, args);
+    const verifiedBinding = JSON.stringify([row.account_id, row.paths]);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const account = { name: row.name, identity: row.account_name };
+    if (call.kind === 'http')
+      return {
+        account,
+        request: {
+          method: call.method,
+          url: call.url,
+          ...(call.method !== 'GET' && args.body !== undefined ? { body: args.body } : {}),
+        },
+        verifiedBinding,
+      };
+    if (call.kind !== 'mcp') throw error('Choose an MCP access path.');
+    const { tools } = await catalog(row, call.path, signal);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const matches = tools.filter((tool) => tool.name === call.tool);
+    if (matches.length !== 1)
+      throw error('The selected MCP tool is unavailable in this connection’s tool list.', 409);
+    return {
+      account: {
+        ...account,
+        method: call.path.kind,
+        endpoint: call.path.endpoint,
+      },
+      tool: matches[0]!,
+      verifiedBinding,
+    };
+  }
   async function execute(
     action: string,
     args: Record<string, unknown>,
@@ -1525,7 +1625,11 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
     expectedBinding?: string,
   ) {
-    const { row, call } = await selected(action, args);
+    const { row, call } = await selected(action, args).catch((cause: unknown) => {
+      throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), {
+        notRun: true,
+      });
+    });
     const { path } = call;
     let token: string | undefined;
     const secrets: string[] = [];
@@ -1544,13 +1648,9 @@ export async function createDiscoveredConnections(
         connection(path),
         async () => {
           signal?.throwIfAborted();
+          await assertBinding(row, expectedBinding);
           token = await tokenFor(row, path, signal);
-          const currentBinding = await binding(row.id);
-          if (
-            currentBinding !== JSON.stringify([row.account_id, row.paths]) ||
-            (expectedBinding !== undefined && currentBinding !== expectedBinding)
-          )
-            throw error('This connected account changed.', 409);
+          await assertBinding(row, expectedBinding);
           signal?.throwIfAborted();
           secrets.push(token);
           const environment =
@@ -1788,6 +1888,7 @@ export async function createDiscoveredConnections(
   return {
     apps,
     binding,
+    approvalDetails,
     analyticsConnections,
     list,
     setupServices,

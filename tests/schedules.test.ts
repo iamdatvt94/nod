@@ -54,6 +54,7 @@ test(
     const watched = new Map<string, string>();
     let watchPolls = 0;
     let modelPaused = false;
+    const clearedBrowsers: string[] = [];
     const personal = createPersonalService({
       pool: db.pool,
       ownerId: 'local-development',
@@ -72,6 +73,9 @@ test(
         return id;
       },
       refresh() {},
+      clearBrowser: async (id) => {
+        clearedBrowsers.push(id);
+      },
       validateModel: (choice) => choice,
     });
     const app = Fastify();
@@ -254,6 +258,114 @@ test(
         schedule_runs_schedule_id_schedule_revision_scheduled_for_key
         UNIQUE(schedule_id,schedule_revision,scheduled_for)`);
       await personal.initialize({ workers: false });
+
+      await t.test(
+        'Stop ends only the selected schedule run and keeps future runs enabled',
+        async () => {
+          const schedule = await create({ title: 'Synthetic stoppable run', cron: '0 9 * * *' });
+          const other = await create({ title: 'Synthetic separate run', cron: '0 10 * * *' });
+          const otherTurn = (await runNow(other)).json().turnId as string;
+          const main = await thread.enqueueTurn('Synthetic separate chat work', {
+            source: 'event',
+          });
+          const stop = (id: string, turnId: string) =>
+            request('POST', `/api/schedules/${id}/runs/${turnId}/stop`);
+          const status = async (id: string) =>
+            (await db.pool.query('SELECT status FROM turns WHERE id=$1', [id])).rows[0].status;
+          const targets: string[] = [];
+          try {
+            for (const state of ['queued', 'running', 'waiting']) {
+              const result = await runNow(await saved(schedule.id));
+              assert.equal(result.statusCode, 200, result.body);
+              const turnId = result.json().turnId as string;
+              targets.push(turnId);
+              await db.pool.query(
+                "UPDATE turns SET status=$2,waiting_reason=CASE WHEN $2='waiting' THEN 'question' ELSE NULL END WHERE id=$1",
+                [turnId, state],
+              );
+              const response = await stop(schedule.id, turnId);
+              assert.equal(response.statusCode, 200, response.body);
+              assert.equal(await status(turnId), 'cancelled');
+              assert.equal((await saved(schedule.id)).enabled, true);
+              assert.equal((await saved(schedule.id)).nextRun, schedule.nextRun);
+              assert.equal(await status(otherTurn), 'queued');
+              assert.equal(await status(main), 'queued');
+              assert.equal(clearedBrowsers.filter((id) => id === turnId).length, 1);
+              await assert.rejects(
+                thread.withTurnLock(turnId, async () => {}),
+                /no longer active/,
+              );
+              assert.equal((await stop(schedule.id, turnId)).statusCode, 200);
+              assert.equal(clearedBrowsers.filter((id) => id === turnId).length, 1);
+            }
+            const resumedRoot = (await runNow(await saved(schedule.id))).json().turnId as string;
+            targets.push(resumedRoot);
+            await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [resumedRoot]);
+            const resumed = await thread.enqueueTurn('Synthetic resumed scheduled work', {
+              source: 'resume',
+              background: true,
+              parentTurnId: resumedRoot,
+              sessionId: resumedRoot,
+            });
+            targets.push(resumed);
+            const folded = await thread.enqueueTurn('Synthetic steering message', {
+              source: 'resume',
+              parentTurnId: resumed,
+              sessionId: resumedRoot,
+            });
+            targets.push(folded);
+            const messageId = randomUUID();
+            await db.pool.query(
+              `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text)
+               SELECT $2,owner_id,thread_id,id,'user','Synthetic steering message' FROM turns WHERE id=$1`,
+              [folded, messageId],
+            );
+            await db.pool.query(
+              "UPDATE turns SET source='user',status='succeeded',message_id=$2 WHERE id=$1",
+              [folded, messageId],
+            );
+            for (const state of ['running', 'waiting', 'failed', 'succeeded']) {
+              await db.pool.query(
+                "UPDATE turns SET status=$2,started_at=now(),waiting_reason=CASE WHEN $2='waiting' THEN 'question' ELSE NULL END WHERE id=$1",
+                [resumed, state],
+              );
+              assert.equal((await saved(schedule.id)).lastRun?.status, state);
+            }
+            await db.pool.query("UPDATE turns SET status='running' WHERE id=$1", [resumed]);
+            const stopped = await stop(schedule.id, resumed);
+            assert.equal(stopped.statusCode, 200, stopped.body);
+            assert.equal(await status(resumed), 'cancelled');
+            assert.equal(clearedBrowsers.at(-1), resumedRoot);
+            assert.equal(
+              (await runs(schedule.id)).find((run) => run.turnId === resumedRoot)?.status,
+              'cancelled',
+            );
+            assert.equal((await saved(schedule.id)).lastRun?.status, 'cancelled');
+            assert.equal(await status(resumedRoot), 'succeeded');
+            const later = (await runNow(await saved(schedule.id))).json().turnId as string;
+            targets.push(later);
+            assert.equal((await stop(schedule.id, resumed)).statusCode, 200);
+            assert.equal(await status(later), 'queued');
+            assert.equal((await stop(other.id, later)).statusCode, 404);
+            assert.equal((await stop(schedule.id, otherTurn)).statusCode, 404);
+            assert.equal((await stop(schedule.id, main)).statusCode, 404);
+            assert.equal((await stop(schedule.id, randomUUID())).statusCode, 404);
+            await db.pool.query('UPDATE schedule_runs SET owner_id=$2 WHERE turn_id=$1', [
+              later,
+              'synthetic-other-owner',
+            ]);
+            assert.equal((await stop(schedule.id, later)).statusCode, 404);
+            assert.equal(await status(later), 'queued');
+            assert.equal((await saved(schedule.id)).enabled, true);
+          } finally {
+            await db.pool.query("UPDATE turns SET status='cancelled' WHERE id=ANY($1::uuid[])", [
+              [...targets, otherTurn, main],
+            ]);
+            await request('DELETE', `/api/schedules/${schedule.id}`);
+            await request('DELETE', `/api/schedules/${other.id}`);
+          }
+        },
+      );
 
       await t.test(
         'manual runs retain timing and start once across concurrent requests and retries',
@@ -585,6 +697,11 @@ test(
             assert.equal(job.startAfter.toISOString(), expected);
             await deliver([job]);
             assert.equal((await runs(schedule.id))[0].scheduledFor, expected);
+            if (frequency === 'monthly')
+              assert.equal(
+                (await personal.getSchedule(schedule.id)).nextRun,
+                '2035-12-31T10:30:00.000Z',
+              );
             await request('DELETE', `/api/schedules/${schedule.id}`);
           }
           const customCron = '15 8 1,15 * 1-5';
@@ -1191,21 +1308,80 @@ test(
           const [first] = await fire();
           await finish();
           assert.deepEqual(await fire(), [first]);
+          const resumed = await thread.enqueueTurn('Synthetic watched resume', {
+            source: 'resume',
+            background: true,
+            parentTurnId: first,
+            sessionId: first,
+          });
+          const stopped = await request(
+            'POST',
+            `/api/schedules/${schedule.id}/runs/${resumed}/stop`,
+          );
+          assert.equal(stopped.statusCode, 200, stopped.body);
+          assert.equal((await runs(schedule.id))[0].status, 'cancelled');
+          assert.equal((await fire()).length, 2);
+          await finish();
           const manual = await runNow(schedule);
           assert.equal(manual.statusCode, 200, manual.body);
-          assert.equal((await runs(schedule.id)).length, 2);
+          assert.equal((await runs(schedule.id)).length, 3);
           await finish('failed');
-          assert.equal((await fire()).length, 3);
-          await finish();
-          assert.equal((await fire()).length, 3);
-          watched.set(account, 'v2');
           assert.equal((await fire()).length, 4);
           await finish();
-          await personal.manage('schedule_update', { id: schedule.id, watch: null });
+          assert.equal((await fire()).length, 4);
+          watched.set(account, 'v2');
           assert.equal((await fire()).length, 5);
+          await finish();
+          await personal.manage('schedule_update', { id: schedule.id, watch: null });
+          assert.equal((await fire()).length, 6);
           await finish();
           await request('DELETE', `/api/schedules/${schedule.id}`);
           clock = before;
+        },
+      );
+      await t.test(
+        'a stopped run at the same scheduled time replaces an earlier success for watch checks',
+        async () => {
+          const before = clock;
+          const account = randomUUID();
+          watched.set(account, 'synthetic-unchanged');
+          const schedule = await create({ cron: '*/15 * * * *', watch: [account] });
+          try {
+            const firstJob = await jobFor(schedule.id);
+            clock = new Date(firstJob.data.scheduledFor);
+            await deliver([firstJob]);
+            const first = (await runs(schedule.id))[0].turnId;
+            await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [first]);
+            const later = (await runNow(await saved(schedule.id))).json().turnId as string;
+            const times = (
+              await db.pool.query(
+                'SELECT scheduled_for FROM schedule_runs WHERE turn_id=ANY($1::uuid[])',
+                [[first, later]],
+              )
+            ).rows;
+            assert.equal(times.length, 2);
+            assert.equal(
+              times[0].scheduled_for.toISOString(),
+              times[1].scheduled_for.toISOString(),
+            );
+            const response = await request(
+              'POST',
+              `/api/schedules/${schedule.id}/runs/${later}/stop`,
+            );
+            assert.equal(response.statusCode, 200, response.body);
+            const nextJob = await jobFor(schedule.id);
+            clock = new Date(nextJob.data.scheduledFor);
+            await deliver([nextJob]);
+            assert.equal((await runs(schedule.id)).length, 3);
+          } finally {
+            await db.pool.query(
+              "UPDATE turns SET status='cancelled' WHERE session_id IN (SELECT turn_id FROM schedule_runs WHERE schedule_id=$1)",
+              [schedule.id],
+            );
+            await request('DELETE', `/api/schedules/${schedule.id}`);
+            watched.delete(account);
+            clock = before;
+          }
         },
       );
       await t.test(
@@ -2277,12 +2453,22 @@ test('waiting scheduled runs open their pending question without starting anothe
   const historyPath = `/api/schedule-runs?scheduleId=${schedule.id}&limit=10`;
   let history: ScheduleHistory = { runs: [completed], nextCursor: null };
   const mutations: string[] = [];
+  let releaseStop = () => {};
+  let stopWait: Promise<void> | undefined;
+  let stopFailure = false;
+  let releaseSchedules = () => {};
+  let scheduleWait: Promise<void> | undefined;
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, options?: RequestInit) => {
     const path = String(input);
     const method = options?.method ?? 'GET';
     if (method !== 'GET') {
       mutations.push(`${method} ${path}`);
       assert.equal(method, 'POST');
+      if (path.endsWith('/stop')) {
+        if (stopFailure) throw new TypeError('Synthetic stop response lost.');
+        await stopWait;
+        return Response.json({ ok: true });
+      }
       assert.equal(path, `/api/schedules/${schedule.id}/run`);
       schedule = {
         ...schedule,
@@ -2292,7 +2478,11 @@ test('waiting scheduled runs open their pending question without starting anothe
       history = { runs: [queued, completed], nextCursor: null };
       return Response.json({ turnId: queued.turnId, activeRun: schedule.activeRun });
     }
-    if (path === '/api/schedules') return Response.json([schedule]);
+    if (path === '/api/schedules') {
+      const response = [schedule];
+      await scheduleWait;
+      return Response.json(response);
+    }
     if (path === '/api/tasks') return Response.json([]);
     assert.equal(path, historyPath);
     return Response.json(history);
@@ -2378,4 +2568,114 @@ test('waiting scheduled runs open their pending question without starting anothe
   assert.deepEqual(mutations, expectedMutations);
   assert.deepEqual(asked, []);
   assert.deepEqual(focused, [{ messageId: questionId }, { messageId: resumedQuestionId }]);
+
+  const confirmedTurnId = schedule.activeRun!.turnId;
+  stopWait = new Promise<void>((resolve) => (releaseStop = resolve));
+  scheduleWait = new Promise<void>((resolve) => (releaseSchedules = resolve));
+  let staleRefresh: Promise<void>;
+  await act(async () => {
+    staleRefresh = pageDataCache.refresh('/api/schedules', true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  const confirmedStop = dom.window.document.querySelector<HTMLButtonElement>(
+    `button[aria-label="Stop this run for ${schedule.title}"]`,
+  );
+  assert.ok(confirmedStop);
+  await act(async () => confirmedStop.click());
+  schedule = { ...schedule, activeRun: null };
+  await act(async () => {
+    releaseStop();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.equal(
+    Boolean(
+      dom.window.document.querySelector(`button[aria-label="Stop this run for ${schedule.title}"]`),
+    ),
+    false,
+  );
+  assert.equal(pageDataCache.getSnapshot<Schedule[]>('/api/schedules').data?.[0].activeRun, null);
+  let replacementRefresh: Promise<void>;
+  await act(async () => {
+    replacementRefresh = pageDataCache.refresh('/api/schedules', true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.equal(
+    Boolean(
+      dom.window.document.querySelector(`button[aria-label="Stop this run for ${schedule.title}"]`),
+    ),
+    false,
+  );
+  await act(async () => {
+    releaseSchedules();
+    await Promise.all([staleRefresh!, replacementRefresh!]);
+  });
+  assert.equal(pageDataCache.getSnapshot<Schedule[]>('/api/schedules').data?.[0].activeRun, null);
+  expectedMutations.push(`POST /api/schedules/${schedule.id}/runs/${confirmedTurnId}/stop`);
+  assert.deepEqual(mutations, expectedMutations);
+  schedule = {
+    ...schedule,
+    activeRun: { turnId: randomUUID(), status: 'running', questionMessageId: null },
+  };
+  await act(async () => pageDataCache.refresh('/api/schedules', true));
+
+  const stoppedTurnId = schedule.activeRun!.turnId;
+  stopWait = new Promise<void>((resolve) => (releaseStop = resolve));
+  const stopButton = dom.window.document.querySelector<HTMLButtonElement>(
+    `button[aria-label="Stop this run for ${schedule.title}"]`,
+  );
+  assert.ok(stopButton);
+  await act(async () => stopButton.click());
+  const stopMutation = `POST /api/schedules/${schedule.id}/runs/${stoppedTurnId}/stop`;
+  assert.deepEqual(mutations, [...expectedMutations, stopMutation]);
+  assert.equal(stopButton.disabled, true);
+  const nextTurnId = randomUUID();
+  schedule = {
+    ...schedule,
+    activeRun: { turnId: nextTurnId, status: 'queued', questionMessageId: null },
+  };
+  await act(async () => pageDataCache.refresh('/api/schedules', true));
+  await act(async () => stopButton.click());
+  assert.deepEqual(mutations, [...expectedMutations, stopMutation]);
+  scheduleWait = new Promise<void>((resolve) => (releaseSchedules = resolve));
+  await act(async () => {
+    releaseStop();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.equal(stopButton.disabled, false);
+  assert.deepEqual(mutations, [...expectedMutations, stopMutation]);
+  await act(async () => {
+    releaseSchedules();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.equal(
+    pageDataCache.getSnapshot<Schedule[]>('/api/schedules').data?.[0].activeRun?.turnId,
+    nextTurnId,
+  );
+  assert.equal(schedule.activeRun?.turnId, nextTurnId);
+  assert.equal(schedule.enabled, true);
+  stopFailure = true;
+  const currentStop = dom.window.document.querySelector<HTMLButtonElement>(
+    `button[aria-label="Stop this run for ${schedule.title}"]`,
+  );
+  assert.ok(currentStop);
+  assert.equal(currentStop.disabled, false);
+  await act(async () => {
+    currentStop.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.match(
+    dom.window.document.body.textContent ?? '',
+    /Could not confirm that this run stopped/,
+  );
+  assert.equal(schedule.enabled, true);
+  assert.equal(mutations.length, expectedMutations.length + 2);
+  assert.equal(mutations.at(-1), `POST /api/schedules/${schedule.id}/runs/${nextTurnId}/stop`);
+  schedule = { ...schedule, activeRun: null };
+  await act(async () => pageDataCache.refresh('/api/schedules', true));
+  assert.equal(
+    Boolean(
+      dom.window.document.querySelector(`button[aria-label="Stop this run for ${schedule.title}"]`),
+    ),
+    false,
+  );
 });

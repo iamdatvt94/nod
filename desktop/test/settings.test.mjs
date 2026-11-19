@@ -43,6 +43,7 @@ import {
 import { createDesktopAnalytics } from '../main/analytics.mjs';
 import { createAppPreferencesStore } from '../main/app-preferences.mjs';
 import { createChatReadCursorStore } from '../main/chat-read-cursors.mjs';
+import { createComputerHelper } from '../main/computer-helper.mjs';
 import { createReadinessNotice, createUnreadBadge, isQuietTime } from '../main/notifications.mjs';
 import { saveArtifactDownload } from '../main/downloads.mjs';
 import { createArtifactFiles } from '../main/artifact-files.mjs';
@@ -723,6 +724,8 @@ async function runningDesktop(
       }),
     }),
     createChatReadCursorStore,
+    createComputerHelper: () => ({ request: async () => ({}), cancel: async () => {} }),
+    createComputerOverlay: () => ({}),
     createArtifactFiles: createFiles,
     saveArtifactDownload,
     createReadinessNotice,
@@ -988,6 +991,7 @@ async function runningDesktop(
       status: () => status,
       notifyReady: updateReadinessNotice,
       checkUpdates: (updater, manual = true, restartReady = false) => { updates = updater; return checkForUpdates(manual, restartReady); },
+      reportUpdateStatus,
       registerFiles: () => { ${source.slice(source.indexOf('      disposeArtifactFiles = registerArtifactFileHandlers('), source.indexOf("      ipcMain.handle('nod:renderer-ready'"))} },
       quit,
       quitApp: (install = true) => { installUpdateOnQuit = install; return quitApp(); },
@@ -3484,6 +3488,16 @@ test('quit requests install once, skip installer conflicts, and still close afte
     const candidate = mode === 'not-ready' ? undefined : { version: '0.10.0' };
     const f = await runningDesktop(t, async () => Response.json({}), {
       platform: 'win32',
+      prompt: (options) => {
+        assert.equal(mode, 'launch-failed');
+        assert.match(options.detail, /Synthetic PowerShell launch failure/);
+        assert.deepEqual(Array.from(options.buttons), [
+          'Retry installation',
+          'Download Nod',
+          'Quit without updating',
+        ]);
+        return { response: 2 };
+      },
       startWindowsInstall: async () => {
         installs++;
         if (mode === 'launch-failed') throw new Error('Synthetic PowerShell launch failure');
@@ -6944,7 +6958,7 @@ test('public GitHub metadata redirects resolve to verified Mac runtime and Windo
 });
 
 test(
-  'manual update failures fence concurrent requests and retry only after an explicit choice without exposing diagnostics',
+  'manual update failures fence concurrent requests and keep the safe reason until an explicit retry',
   { timeout: 10_000 },
   async (t) => {
     const failure = new Error(
@@ -6981,7 +6995,8 @@ test(
       assert.equal(checks, 1);
       assert.equal(prompts.length, 1);
       assert.equal(f.updateMenu.enabled, false);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic updater transport failure'), false);
+      assert.match(prompts[0].detail, /Synthetic updater transport failure/);
+      assert.equal(prompts[0].detail.includes('updates.example.invalid'), false);
       decision.resolve({ response: 0 });
       await Promise.all([initial, duplicate, duringDialog]);
       assert.equal(checks, 2);
@@ -6999,7 +7014,7 @@ test(
   },
 );
 
-test('declining a manual update retry and failed background checks never repeat work or show background errors', async (t) => {
+test('declining a manual update retry and failed background checks never repeat work or open background dialogs', async (t) => {
   for (const manual of [true, false]) {
     let checks = 0;
     const prompts = [];
@@ -7012,7 +7027,7 @@ test('declining a manual update retry and failed background checks never repeat 
     const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
       prompt: (options) => {
         prompts.push(options);
-        return { response: 1 };
+        return { response: 2 };
       },
     });
     if (manual) await f.checkUpdates(updater);
@@ -7020,7 +7035,8 @@ test('declining a manual update retry and failed background checks never repeat 
       await assert.rejects(f.checkUpdates(updater, false), /Synthetic update service unavailable/);
     assert.equal(checks, 1);
     assert.equal(prompts.length, manual ? 1 : 0);
-    assert.equal(JSON.stringify(prompts).includes('Synthetic update service unavailable'), false);
+    if (manual) assert.match(prompts[0].detail, /Synthetic update service unavailable/);
+    assert.equal(f.externalURLs.length, 0);
     assert.equal(f.updateMenu.enabled, true);
   }
 });
@@ -7063,14 +7079,14 @@ test(
       const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
         prompt: (options) => {
           prompts.push(options);
-          return { response: prompts.length === 2 && !retry ? 1 : 0 };
+          return { response: prompts.length === 2 && !retry ? 2 : 0 };
         },
       });
       await f.checkUpdates(updater);
       assert.equal(restarts, retry ? 2 : 1);
       assert.equal(prompts.length, 2);
       assert.equal(updater.ready, candidate);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic native restart failure'), false);
+      assert.match(prompts[1].detail, /Synthetic native restart failure/);
       if (!retry) {
         await f.checkUpdates(updater, true, true);
         assert.equal(restarts, 2);
@@ -8434,6 +8450,414 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
   }
 });
 
+test('manual update failures offer only the official download page without another update attempt', async (t) => {
+  let checks = 0;
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 1 }),
+  });
+  await f.checkUpdates({
+    check: async () => {
+      checks++;
+      throw new Error('The desktop update download timed out.');
+    },
+  });
+  assert.equal(checks, 1);
+  assert.deepEqual(f.externalURLs, ['https://nod.n8n.io/docs/get-started/install-desktop/']);
+});
+
+test('update release lookup and metadata failures keep their HTTP status', async () => {
+  const request = async () => new Response(null, { status: 503 });
+  await assert.rejects(createUpdateSource({ fetch: request }).latest('0.1.0'), /HTTP 503/);
+  await assert.rejects(
+    createUpdateSource({ sourceUrl: 'https://updates.example.invalid/nod', fetch: request }).latest(
+      '0.1.0',
+    ),
+    /HTTP 503/,
+  );
+});
+
+test('failed desktop updates expose safe details and allow an explicit retry without a background dialog', async (t) => {
+  const prompts = [];
+  let checks = 0;
+  const failure = new Error(
+    "The update download failed (HTTP 503) at https://private.example.invalid/update '/Users/Synthetic Owner/Updates/archive.zip' token=PRIVATE_UPDATE_TOKEN",
+    { cause: Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' }) },
+  );
+  const updater = {
+    async check() {
+      checks++;
+      if (checks < 3) throw failure;
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: (options) => {
+      prompts.push(options);
+      return { response: 2 };
+    },
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  const reported = status(event).failure;
+  assert.ok(reported);
+  assert.match(reported.message, /HTTP 503/);
+  assert.match(reported.message, /ECONNRESET/);
+  for (const privateValue of ['private.example.invalid', 'Synthetic Owner', 'PRIVATE_UPDATE_TOKEN'])
+    assert.equal(reported.message.includes(privateValue), false);
+  assert.equal(prompts.length, 0);
+  assert.equal(checks, 1);
+  assert.ok(
+    window.sent.some(([channel, value]) => channel === 'nod:updates:status' && value.failure),
+  );
+  f.handlers.get('nod:updates:dismiss')(event, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  assert.equal(status(event).failure.id, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  const retry = f.handlers.get('nod:updates:retry');
+  await assert.rejects(retry({ ...event, senderFrame: {} }, reported.id), /unavailable/);
+  await assert.rejects(retry(event, reported.id + 1), /changed/);
+  await retry(event, reported.id);
+  assert.equal(checks, 3);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(retry(event, reported.id), /changed/);
+  assert.equal(checks, 3);
+});
+
+test('update failure details mask paths with spaces and keep structured reasons and statuses', async (t) => {
+  for (const failure of [
+    new Error('Could not access /Users/Synthetic Owner/Updates/archive.zip: EACCES'),
+    Object.assign(new Error('Could not access C:\\Users\\Synthetic Owner\\Updates\\archive.zip'), {
+      code: 'EACCES',
+    }),
+    Object.assign(new Error('The update request failed.'), {
+      status: 403,
+      cause: Object.assign(new Error('The signature is invalid.'), { code: 'EACCES' }),
+    }),
+    new Error(
+      'The update failed {"reason":"The signature is invalid.","status":403,"private":"PRIVATE_UPDATE_TOKEN"}',
+    ),
+    new Error('The request failed: access_token=PRIVATE_UPDATE_TOKEN'),
+    new Error('getaddrinfo ENOTFOUND private-host.example.invalid'),
+    new Error('getaddrinfo ENOTFOUND synthetic-device'),
+    new Error('connect ECONNREFUSED 192.0.2.41:443'),
+    new Error('connect ECONNREFUSED [2001:db8::41]:443'),
+    new Error('connect ECONNREFUSED ::ffff:192.0.2.41'),
+    new Error('connect ECONNREFUSED fe80::41%synthetic-device'),
+    new Error('connect ECONNREFUSED localhost:443'),
+    Object.assign(new Error('The update failed.'), { code: 'PRIVATE_UPDATE_TOKEN' }),
+    new Error(
+      'The update failed {"code":"PRIVATE_UPDATE_TOKEN","reason":"The signature is invalid."}',
+    ),
+  ]) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    f.showEngine();
+    await new Promise(setImmediate);
+    const window = f.windows.at(-1);
+    const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            throw failure;
+          },
+        },
+        false,
+      ),
+    );
+    const message = f.handlers.get('nod:updates:status')(event).failure.message;
+    for (const privateValue of [
+      'Synthetic',
+      'Owner',
+      'archive.zip',
+      'PRIVATE_UPDATE_TOKEN',
+      'private-host',
+      'example.invalid',
+      '192.0.2.41',
+      '2001:db8',
+      'fe80::41',
+      'synthetic-device',
+      'localhost',
+    ])
+      assert.equal(message.includes(privateValue), false);
+    if (failure.status || failure.message.includes('"status":403'))
+      assert.match(message, /HTTP 403/);
+    if (failure.cause || failure.message.includes('"reason"'))
+      assert.match(message, /signature is invalid/);
+    if (failure.code === 'EACCES') assert.match(message, /EACCES/);
+  }
+});
+
+test('update diagnostics keep the failed preparation or download step', async (t) => {
+  for (const phase of ['checking', 'preparing', 'downloading']) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            f.reportUpdateStatus(phase);
+            throw new Error('The update request failed (HTTP 503).');
+          },
+        },
+        false,
+      ),
+    );
+    const log = await readFile(join(f.profileRoot, 'logs/startup.log'), 'utf8');
+    assert.ok(log.includes('update error phase=' + phase + ' '));
+  }
+});
+
+test('native update installation failures show the reason and retry or open the download page after shutdown', async (t) => {
+  for (const platform of ['win32', 'darwin'])
+    for (const choice of [0, 1, 2]) {
+      let installs = 0;
+      let exits = 0;
+      const prompts = [];
+      const install = () => {
+        installs++;
+        if (installs === 1)
+          throw Object.assign(
+            new Error('The update installer failed at /Users/Synthetic Owner/archive.zip'),
+            { code: 'EACCES' },
+          );
+      };
+      const f = await runningDesktop(
+        t,
+        async (url) =>
+          Response.json(
+            new URL(url).pathname === '/api/desktop/status' ? { running: [] } : { ok: true },
+          ),
+        {
+          platform,
+          allowStart: true,
+          startWindowsInstall: install,
+          quitAndInstall: install,
+          exit: () => {
+            exits++;
+          },
+          prompt: (options) => {
+            prompts.push(options);
+            return { response: choice };
+          },
+        },
+      );
+      f.crash();
+      await f.prepare();
+      f.showEngine();
+      await new Promise(setImmediate);
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.restartForUpdate();
+      assert.equal(installs, choice === 0 ? 2 : 1);
+      assert.equal(prompts.length, 1);
+      assert.match(prompts[0].message, /could not install/);
+      assert.match(prompts[0].detail, /EACCES/);
+      assert.equal(prompts[0].detail.includes('Synthetic Owner'), false);
+      assert.equal(f.children[0].killed, true);
+      assert.equal(exits, platform === 'win32' || choice !== 0 ? 1 : 0);
+      assert.deepEqual(
+        f.externalURLs,
+        choice === 1 ? ['https://nod.n8n.io/docs/get-started/install-desktop/'] : [],
+      );
+    }
+});
+
+test('a failed in-app restart keeps the verified update and retries it once with the current failure ID', async (t) => {
+  let checks = 0;
+  let restarts = 0;
+  const candidate = { version: '0.5.2' };
+  const updater = {
+    ready: candidate,
+    async check() {
+      checks++;
+      return candidate;
+    },
+    async restart() {
+      restarts++;
+      if (restarts === 1) throw new Error('The installer could not start (code 7).');
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 2 }),
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await f.checkUpdates(updater, false);
+  await f.handlers.get('nod:updates:restart')(event);
+  assert.equal(restarts, 1);
+  assert.equal(status(event).failure.phase, 'restart');
+  assert.equal(status(event).readyVersion, candidate.version);
+  const id = status(event).failure.id;
+  const bridge = await engineBridge(window, f.handlers);
+  const client = await onboardingClient(bridge.bridge);
+  await client.retryDesktopUpdate(id);
+  assert.equal(restarts, 2);
+  assert.equal(checks, 1);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(client.retryDesktopUpdate(id), /changed/);
+  assert.equal(restarts, 2);
+});
+
+test('a failed browser open keeps an explicit retry and lets a stopped app quit', async (t) => {
+  for (const stopped of [false, true]) {
+    let opens = 0;
+    let exits = 0;
+    let openingPrompts = 0;
+    const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+      platform: 'win32',
+      startWindowsInstall: async () => {
+        throw new Error('The installer could not start.');
+      },
+      openExternal: async () => {
+        opens++;
+        throw Object.assign(new Error('The browser could not open.'), { code: 'EACCES' });
+      },
+      exit: () => {
+        exits++;
+      },
+      prompt: (options) => {
+        if (options.message === 'Nod could not open the download page.') {
+          openingPrompts++;
+          assert.match(options.detail, /EACCES/);
+          assert.match(
+            options.detail,
+            /https:\/\/nod\.n8n\.io\/docs\/get-started\/install-desktop\//,
+          );
+          assert.equal(options.buttons[1], stopped ? 'Quit Nod' : 'Not now');
+          return { response: openingPrompts === 1 ? 0 : 1 };
+        }
+        return { response: 1 };
+      },
+    });
+    if (stopped) {
+      f.crash();
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.quitApp();
+    } else {
+      f.showEngine();
+      await new Promise(setImmediate);
+      const window = f.windows.at(-1);
+      const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+      const download = f.handlers.get('nod:updates:download');
+      assert.throws(() => download({ ...event, senderFrame: {} }), /unavailable/);
+      await download(event);
+    }
+    assert.equal(opens, 2);
+    assert.equal(openingPrompts, 2);
+    assert.equal(exits, Number(stopped));
+  }
+});
+
+test('the update notice shows failure recovery and keeps newer status after a late initial read', async (t) => {
+  const bundled = await build({
+    stdin: {
+      contents: `import {createRoot} from 'react-dom/client';
+        import {flushSync} from 'react-dom';
+        import {createElement} from 'react';
+        import {DesktopUpdateToast} from './src/web/components/desktop-update-toast';
+        export {flushSync};
+        const root = createRoot(document.getElementById('root'));
+        export function mount() { flushSync(() => root.render(createElement(DesktopUpdateToast))); }
+        export function close() { flushSync(() => root.unmount()); }`,
+      resolveDir: fileURLToPath(new URL('../..', import.meta.url)),
+    },
+    bundle: true,
+    format: 'iife',
+    globalName: 'updateNotice',
+    write: false,
+    jsx: 'automatic',
+  });
+  const page = new JSDOM('<!doctype html><div id="root"></div>', {
+    url: 'https://app.example.invalid',
+    runScripts: 'outside-only',
+  });
+  t.after(() => page.window.close());
+  const initial = deferred();
+  const retried = deferred();
+  const retries = [];
+  const dismissals = [];
+  let downloads = 0;
+  let listener;
+  page.window.nodDesktop = {
+    updateStatus: () => initial.promise,
+    onUpdateStatus: (receive) => {
+      listener = receive;
+      return () => {
+        listener = undefined;
+      };
+    },
+    retryUpdate: async (id) => {
+      retries.push(id);
+      await retried.promise;
+    },
+    dismissUpdate: async (id) => {
+      dismissals.push(id);
+    },
+    downloadUpdate: async () => {
+      downloads++;
+    },
+  };
+  page.window.eval(bundled.outputFiles[0].text);
+  const view = page.window.updateNotice;
+  t.after(() => view.close());
+  view.mount();
+  const failed = {
+    phase: 'idle',
+    checking: false,
+    readyVersion: '0.5.1',
+    failure: { id: 1, phase: 'downloading', message: 'The download timed out.' },
+  };
+  view.flushSync(() => listener(failed));
+  initial.resolve({ phase: 'idle', checking: false });
+  await new Promise(setImmediate);
+  const document = page.window.document;
+  assert.match(document.body.textContent, /could not download/);
+  assert.match(document.querySelector('[role="alert"]').textContent, /timed out/);
+  assert.equal(
+    document.querySelector('a').href,
+    'https://nod.n8n.io/docs/get-started/install-desktop/',
+  );
+  view.flushSync(() => document.querySelector('a').click());
+  assert.equal(downloads, 1);
+  const button = (label) =>
+    [...document.querySelectorAll('button')].find((entry) => entry.textContent === label);
+  view.flushSync(() => button('Try again').click());
+  assert.deepEqual(retries, [1]);
+  assert.equal(button('Please wait…').disabled, true);
+  retried.reject(new Error('The update failure has changed. Check the update notice.'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(document.body.textContent, /failure has changed/);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, id: 2 } }));
+  view.flushSync(() => button('Dismiss').click());
+  assert.deepEqual(dismissals, [2]);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.match(document.body.textContent, /Nod 0.5.2 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  assert.equal(button('Restart to update').disabled, false);
+  view.flushSync(() => button('Later').click());
+  assert.deepEqual(dismissals, [2, '0.5.2']);
+});
+
 test('ready desktop updates share Later across engine windows and reopen for a new version', async (t) => {
   let version = '0.5.2';
   const restarts = [];
@@ -8806,6 +9230,693 @@ test('legacy account completion migrates to device progress without changing key
   assert.equal(Object.hasOwn(migrated, 'onboardingCompleted'), false);
   assert.deepEqual(migrated.secrets, value.secrets);
   assert.deepEqual(await f.reopen().environment(), environment);
+});
+
+async function fakeDesktop(t, answers, options = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'nod-desktop-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const log = join(root, 'log.jsonl');
+  const binary = join(root, 'agent-desktop');
+  await writeFile(
+    binary,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const input = fs.readFileSync(0, 'utf8');
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, input }) + '\\n');
+const answers = ${JSON.stringify(answers)};
+const key = Object.keys(answers).find((prefix) => args.join(' ').startsWith(prefix));
+let answer = key ? answers[key] : { ok: true, data: args[0] === 'snapshot' ? { complete: true, tree: { role: 'window', name: 'Mail' } } : {} };
+if (Array.isArray(answer)) {
+  const counter = ${JSON.stringify(log)} + '.' + key.replaceAll(' ', '_');
+  const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;
+  fs.writeFileSync(counter, String(seen + 1));
+  answer = answer[Math.min(seen, answer.length - 1)];
+}
+process.stdout.write(JSON.stringify(answer));
+`,
+    { mode: 0o755 },
+  );
+  const events = [];
+  let clipboard = 'owner copied this';
+  const presence = {
+    ownPid: -1,
+    idle: [5],
+    idleSeconds: () => (presence.idle.length > 1 ? presence.idle.shift() : presence.idle[0]),
+    show: (state) =>
+      events.push(state.background ? 'background' : state.waiting ? 'waiting' : 'shown'),
+    hide: () => events.push('hidden'),
+    focusSelf: () => events.push('focus Nod'),
+    clipboard: {
+      save: () => clipboard,
+      write: (text) => {
+        clipboard = text;
+      },
+      restore: (saved) => {
+        clipboard = saved;
+      },
+    },
+  };
+  const helper = createComputerHelper({
+    binary,
+    home: join(root, 'home'),
+    requestPermission: async () => {},
+    presence,
+    ownerWaitMs: 300,
+    lingerMs: 20,
+    backgroundLingerMs: 20,
+    platform: 'darwin',
+    ...options,
+  });
+  return {
+    helper,
+    presence,
+    events,
+    clipboard: () => clipboard,
+    calls: async () =>
+      (await readFile(log, 'utf8').catch(() => ''))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).args.join(' '))
+        .filter((call) => !call.startsWith('list-windows')),
+  };
+}
+
+const mailWindow = {
+  ok: true,
+  data: [
+    {
+      id: 'w-1',
+      pid: process.pid,
+      app_name: 'Mail',
+      is_focused: true,
+      bounds: { x: 10, y: 10, width: 400, height: 300 },
+    },
+  ],
+};
+const refused = (code, message) => ({ ok: false, error: { code, message } });
+
+test('computer use binds current window content and hides password content', async (t) => {
+  const window = (value, ref, focused = false) => ({
+    ok: true,
+    data: {
+      complete: true,
+      tree: {
+        role: 'window',
+        name: 'Message',
+        children: [
+          { role: 'textfield', name: 'To', value, ref_id: ref, states: focused ? ['focused'] : [] },
+          {
+            role: 'textfield',
+            name: 'private password label',
+            value: 'private password value',
+            states: ['secure'],
+            children: [{ role: 'text', name: 'private password child', states: ['focused'] }],
+          },
+        ],
+      },
+    },
+  });
+  const withButton = (...children) => {
+    const read = window('bo@example.test', '@sfourth1:e2');
+    read.data.tree.children.push({ role: 'button', name: 'Full Screen', children });
+    return read;
+  };
+  const desktop = await fakeDesktop(t, {
+    snapshot: [
+      window('ana@example.test', '@sfirst01:e1'),
+      window('ana@example.test', '@ssecond1:e8', true),
+      window('bo@example.test', '@sthird01:e2'),
+      withButton({ role: 'group', children: [{ role: 'group' }] }),
+      withButton(),
+      { ok: true, data: { complete: false, tree: { role: 'window' } } },
+      { ok: true, data: { complete: true, tree: { role: 'window', children_count: 1 } } },
+    ],
+  });
+  const inspect = () => desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  const first = await inspect();
+  const second = await inspect();
+  const third = await inspect();
+  assert.equal(first.state, second.state);
+  assert.notEqual(first.focus, second.focus);
+  assert.notEqual(first.state, third.state);
+  const fourth = await inspect();
+  assert.equal(
+    fourth.state,
+    (await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' })).state,
+  );
+  assert.doesNotMatch(JSON.stringify(first), /private password/);
+  await assert.rejects(inspect(), /complete window/);
+  await assert.rejects(inspect(), /Part of the window is missing/);
+});
+
+test('computer use binds a long list only by the rows the step needs', async (t) => {
+  const inbox = (subjects, selected, button = 'New Message') => ({
+    ok: true,
+    data: {
+      complete: true,
+      tree: {
+        role: 'window',
+        name: 'Inbox',
+        children: [
+          { role: 'toolbar', children: [{ role: 'button', name: button }] },
+          {
+            role: 'table',
+            children: subjects.map((name) => ({
+              role: 'row',
+              name,
+              states: name === selected ? ['selected'] : [],
+            })),
+          },
+        ],
+      },
+    },
+  });
+  const rows = (count) => Array.from({ length: count }, (_, index) => `Message ${index}`);
+  const desktop = await fakeDesktop(t, {
+    snapshot: [
+      inbox(rows(500), 'Message 7'),
+      inbox(['Just arrived', ...rows(500)], 'Message 7'),
+      inbox(rows(500), 'Message 8'),
+      inbox(rows(500), 'Message 7', 'Archive'),
+      {
+        ok: true,
+        data: {
+          complete: true,
+          tree: {
+            role: 'window',
+            name: 'New Message',
+            children: [
+              { role: 'button', name: 'New Message' },
+              ...rows(25).map((name) => ({ role: 'textfield', name, value: `${name} value` })),
+            ],
+          },
+        },
+      },
+    ],
+  });
+  const inspect = () =>
+    desktop.helper.request({
+      op: 'inspect',
+      app: 'Mail',
+      window: 'w-1',
+      control: { role: 'button', name: 'New Message' },
+    });
+  const first = await inspect();
+  const arrived = await inspect();
+  const moved = await inspect();
+  assert.equal(first.incomplete, true);
+  assert.match(JSON.stringify(first.tree), /New Message.*Message 7/);
+  assert.doesNotMatch(JSON.stringify(first.tree), /Message 8|Message 499/);
+  assert.equal(first.state, arrived.state);
+  assert.notEqual(first.state, moved.state);
+  await assert.rejects(inspect(), /no longer in the window/);
+  const compose = await inspect();
+  assert.equal(compose.incomplete, false);
+  assert.match(JSON.stringify(compose.tree), /Message 24 value/);
+});
+
+test('computer use can create a first document without exposing the Apple or app menu', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'snapshot --root': {
+      ok: true,
+      data: { complete: true, tree: { role: 'menuitem', name: 'New' } },
+    },
+    snapshot: {
+      ok: true,
+      data: {
+        complete: true,
+        tree: {
+          role: 'menu',
+          children: [
+            { role: 'menuitem', name: 'Apple', children: [{ role: 'menuitem', name: 'Restart' }] },
+            {
+              role: 'menuitem',
+              name: 'TextEdit',
+              children: [{ role: 'menuitem', name: 'Services' }],
+            },
+            { role: 'menuitem', name: 'File', children: [{ role: 'menuitem', name: 'New' }] },
+          ],
+        },
+      },
+    },
+  });
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'TextEdit', menu: true });
+  assert.doesNotMatch(JSON.stringify(inspected), /Apple|Restart|Services/);
+  await desktop.helper.request({
+    op: 'press',
+    app: 'TextEdit',
+    menu: true,
+    ref: '@sfirst01:e1',
+    expected: inspected.state,
+    control: { role: 'menuitem', name: 'New' },
+  });
+  assert.ok((await desktop.calls()).includes('click @sfirst01:e1'));
+});
+
+test('computer use checks the window again after waiting for the owner', async (t) => {
+  const tree = (value) => ({
+    role: 'window',
+    name: 'Mail',
+    children: [{ role: 'textfield', name: 'To', value }],
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      snapshot: [
+        { ok: true, data: { complete: true, tree: tree('ana@example.test') } },
+        { ok: true, data: { complete: true, tree: tree('bo@example.test') } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  desktop.presence.idle = [0, 5];
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'ctrl+enter',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+    }),
+    /STALE_REF: That window changed/,
+  );
+  assert.ok(desktop.events.includes('waiting'));
+  assert.ok(!(await desktop.calls()).some((call) => call.startsWith('press ')));
+});
+
+test('computer use refuses a password focus or renamed control at delivery', async (t) => {
+  const secured = (focused) => ({
+    role: 'window',
+    children: [{ role: 'textfield', states: focused ? ['secure', 'focused'] : ['secure'] }],
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      'snapshot --root': {
+        ok: true,
+        data: { complete: true, tree: { role: 'button', name: 'Delete' } },
+      },
+      snapshot: [
+        { ok: true, data: { complete: true, tree: secured(false) } },
+        { ok: true, data: { complete: true, tree: secured(true) } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({ op: 'inspect', app: 'Mail', window: 'w-1' });
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'x',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+      noSecureFocus: true,
+    }),
+    /password field has focus/,
+  );
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@sfirst01:e1',
+      app: 'Mail',
+      window: 'w-1',
+      control: { role: 'button', name: 'Send' },
+    }),
+    /STALE_REF: That control changed/,
+  );
+  assert.ok(!(await desktop.calls()).some((call) => /^(press|click) /.test(call)));
+});
+
+test('computer use refuses a changed keyboard target even when window content stays the same', async (t) => {
+  const tree = (selected) => ({
+    role: 'window',
+    children: ['First', 'Second'].map((name, index) => ({
+      role: 'textfield',
+      name,
+      value: '',
+      states: index === selected ? ['focused'] : [],
+    })),
+  });
+  const desktop = await fakeDesktop(
+    t,
+    {
+      'list-windows': mailWindow,
+      snapshot: [
+        { ok: true, data: { complete: true, tree: tree(0) } },
+        { ok: true, data: { complete: true, tree: tree(1) } },
+      ],
+    },
+    { platform: 'win32' },
+  );
+  const inspected = await desktop.helper.request({
+    op: 'inspect',
+    app: 'Mail',
+    window: 'w-1',
+    focus: true,
+  });
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'key',
+      keys: 'enter',
+      app: 'Mail',
+      window: 'w-1',
+      expected: inspected.state,
+      expectedFocus: inspected.focus,
+    }),
+    /keyboard target changed/,
+  );
+  assert.ok(!(await desktop.calls()).some((call) => call.startsWith('press ')));
+});
+
+test('computer use takes focus only after a refusal before delivery, and only while the owner pauses', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'press cmd+n --app Mail --window-id w-1 --headed': { ok: true, data: {} },
+    'press cmd+n': refused(
+      'STALE_REF',
+      "The named window's exact focus could not be confirmed, so no key was sent",
+    ),
+    'click @s1abcdef:e1': refused(
+      'ACTION_FAILED',
+      'AXPress did not establish a verifiable effect; mutation outcome is uncertain',
+    ),
+  });
+  const key = { op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' };
+  desktop.presence.idle = [0, 0, 5];
+  await desktop.helper.request(key);
+  assert.deepEqual(await desktop.calls(), [
+    'press cmd+n --app Mail --window-id w-1',
+    'focus-window --app Mail --window-id w-1',
+    'press cmd+n --app Mail --window-id w-1 --headed',
+  ]);
+  assert.deepEqual(desktop.events.slice(0, 3), ['background', 'waiting', 'shown']);
+  await waitFor(() => assert.ok(desktop.events.includes('hidden')), { interval: 10 });
+
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@s1abcdef:e1',
+      app: 'Mail',
+      window: 'w-1',
+      role: 'button',
+    }),
+    /ACTION_FAILED/,
+  );
+  assert.equal((await desktop.calls()).filter((call) => call.startsWith('click')).length, 1);
+
+  desktop.presence.idle = [0];
+  const before = (await desktop.calls()).length;
+  await assert.rejects(desktop.helper.request(key), /OWNER_ACTIVE/);
+  assert.deepEqual((await desktop.calls()).slice(before), [
+    'press cmd+n --app Mail --window-id w-1',
+  ]);
+});
+
+test('computer use Stop for all work still gives focus back to the owner window', async (t) => {
+  const notes = {
+    id: 'w-2',
+    pid: process.pid,
+    app_name: 'TextEdit',
+    is_focused: true,
+    bounds: { x: 0, y: 0, width: 300, height: 200 },
+  };
+  const mail = { ...mailWindow.data[0], is_focused: false };
+  const desktop = await fakeDesktop(t, {
+    'list-windows --app': mailWindow,
+    'list-windows': [
+      { ok: true, data: [notes, mail] },
+      {
+        ok: true,
+        data: [
+          { ...notes, is_focused: false },
+          { ...mail, is_focused: true },
+        ],
+      },
+    ],
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  const show = desktop.presence.show;
+  desktop.presence.show = (state) => {
+    show(state);
+    if (!state.background && !state.waiting) void desktop.helper.cancel();
+  };
+  await assert.rejects(
+    desktop.helper.request({ op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' }),
+    /STOPPED/,
+  );
+  const calls = await desktop.calls();
+  assert.ok(calls.includes('focus-window --app TextEdit --window-id w-2'), calls.join('\n'));
+  assert.ok(!calls.includes('press cmd+n --app Mail --window-id w-1 --headed'));
+});
+
+test('computer use Stop for all work refuses later commands of a step already running', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  const show = desktop.presence.show;
+  desktop.presence.show = (state) => {
+    show(state);
+    void desktop.helper.cancel();
+  };
+  await assert.rejects(
+    desktop.helper.request({ op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' }),
+    /STOPPED/,
+  );
+  assert.deepEqual(await desktop.calls(), []);
+});
+
+test('computer use Stop ends only its own step, and no step starts after its deadline', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'press cmd+n --app Mail --window-id w-1 --headed': { ok: true, data: {} },
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  desktop.presence.idle = [0];
+  const pending = desktop.helper.request({
+    op: 'key',
+    keys: 'cmd+n',
+    app: 'Mail',
+    window: 'w-1',
+    step: 'mine',
+  });
+  await waitFor(() => assert.ok(desktop.events.includes('waiting')), { interval: 10 });
+  await desktop.helper.request({ op: 'cancel', step: 'another' });
+  const settled = await Promise.race([
+    pending.then(
+      () => 'done',
+      () => 'failed',
+    ),
+    new Promise((resolve) => setTimeout(() => resolve('waiting'), 100)),
+  ]);
+  assert.equal(settled, 'waiting');
+  await desktop.helper.request({ op: 'cancel', step: 'mine' });
+  await assert.rejects(pending, /STOPPED/);
+  assert.deepEqual(await desktop.calls(), ['press cmd+n --app Mail --window-id w-1']);
+  assert.equal(desktop.events.at(-1), 'hidden');
+
+  await assert.rejects(
+    desktop.helper.request({
+      op: 'press',
+      ref: '@s1abcdef:e1',
+      app: 'Mail',
+      window: 'w-1',
+      role: 'button',
+      deadline: Date.now() - 1,
+    }),
+    /STOPPED/,
+  );
+  assert.deepEqual(await desktop.calls(), ['press cmd+n --app Mail --window-id w-1']);
+});
+
+test('computer use pastes into a message body in front and restores the owner clipboard', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  await desktop.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'scrollarea',
+    text: 'Hi Toni',
+  });
+  assert.deepEqual(await desktop.calls(), [
+    'focus-window --app Mail --window-id w-1',
+    'focus @s1abcdef:e1',
+    'snapshot --app Mail --window-id w-1 --max-depth 50',
+    'press cmd+v --app Mail --window-id w-1 --headed',
+  ]);
+  assert.equal(desktop.clipboard(), 'owner copied this');
+});
+
+test('computer use shows Nod working in an app during background steps, then hides it', async (t) => {
+  const desktop = await fakeDesktop(t, { 'list-windows': mailWindow });
+  await desktop.helper.request({
+    op: 'press',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'button',
+  });
+  assert.deepEqual(await desktop.calls(), ['click @s1abcdef:e1']);
+  assert.deepEqual(desktop.events, ['background']);
+  await waitFor(() => assert.ok(desktop.events.includes('hidden')), { interval: 10 });
+});
+
+test('computer use pastes with ctrl+v on Linux and Windows, and types from the front on Windows', async (t) => {
+  const linux = await fakeDesktop(t, { 'list-windows': mailWindow }, { platform: 'linux' });
+  await linux.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'document',
+    text: 'Hi Toni',
+  });
+  assert.equal((await linux.calls()).at(-1), 'press ctrl+v --app Mail --window-id w-1 --headed');
+
+  const windows = await fakeDesktop(t, { 'list-windows': mailWindow }, { platform: 'win32' });
+  await windows.helper.request({
+    op: 'type',
+    ref: '@s1abcdef:e1',
+    app: 'Mail',
+    window: 'w-1',
+    role: 'textfield',
+    text: 'Hi',
+  });
+  assert.deepEqual(await windows.calls(), [
+    'focus-window --app Mail --window-id w-1',
+    'type @s1abcdef:e1 --stdin --headed',
+  ]);
+});
+
+test('computer use on Linux opens only installed desktop apps that do not run in a terminal', async (t) => {
+  const data = await mkdtemp(join(tmpdir(), 'nod-desktop-entries-'));
+  t.after(() => rm(data, { recursive: true, force: true }));
+  await mkdir(join(data, 'applications'));
+  await writeFile(
+    join(data, 'applications', 'org.gnome.TextEditor.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Text Editor\nExec=gnome-text-editor\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'debian-xterm.desktop'),
+    '[Desktop Entry]\nType=Application\nName=XTerm\nExec=xterm\nCategories=System;TerminalEmulator;\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'org.gnome.Settings.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Settings\nExec=gnome-control-center\nCategories=GTK;Settings;\n',
+  );
+  await writeFile(
+    join(data, 'applications', 'org.gnome.Terminal.desktop'),
+    '[Desktop Entry]\nType=Application\nName=Terminal\nExec=gnome-terminal\nTerminal=true\n',
+  );
+  const saved = { home: process.env.XDG_DATA_HOME, dirs: process.env.XDG_DATA_DIRS };
+  process.env.XDG_DATA_HOME = data;
+  process.env.XDG_DATA_DIRS = join(data, 'none');
+  t.after(() => {
+    for (const [name, value] of [
+      ['XDG_DATA_HOME', saved.home],
+      ['XDG_DATA_DIRS', saved.dirs],
+    ])
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+  });
+  const desktop = await fakeDesktop(
+    t,
+    { status: { ok: true, data: { supported_surfaces: ['window', 'menu'] } } },
+    { platform: 'linux' },
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'locate', bundle: 'org.gnome.TextEditor' }), {
+    bundle: 'org.gnome.TextEditor',
+    name: 'Text Editor',
+    program: 'gnome-text-editor',
+  });
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'debian-xterm' }),
+    /runs in a terminal/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'org.gnome.Settings' }),
+    /system, settings or file manager/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'org.gnome.Terminal' }),
+    /runs in a terminal/,
+  );
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'bash' }),
+    /No app with the desktop ID/,
+  );
+  assert.deepEqual(await desktop.calls(), []);
+  await assert.rejects(
+    desktop.helper.request({ op: 'snapshot', app: 'gedit', menu: true }),
+    /ACTION_NOT_SUPPORTED: This computer has no separate menu bar/,
+  );
+
+  const flatpak = await fakeDesktop(t, {}, { platform: 'linux', sandboxed: true });
+  await assert.rejects(
+    flatpak.helper.request({ op: 'open', bundle: 'org.gnome.TextEditor' }),
+    /Flatpak sandbox/,
+  );
+});
+
+test('computer use on Windows starts only windowed programs', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-windows-root-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'System32'));
+  const program = (subsystem) => {
+    const header = Buffer.alloc(256);
+    header.write('MZ', 0, 'latin1');
+    header.writeUInt32LE(0x80, 0x3c);
+    header.write('PE\0\0', 0x80, 'latin1');
+    header.writeUInt16LE(subsystem, 0x80 + 0x5c);
+    return header;
+  };
+  await writeFile(join(root, 'System32', 'notepad.exe'), program(2));
+  await writeFile(join(root, 'System32', 'logoff.exe'), program(3));
+  const saved = process.env.SystemRoot;
+  process.env.SystemRoot = root;
+  t.after(() => {
+    if (saved === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = saved;
+  });
+  const desktop = await fakeDesktop(
+    t,
+    { launch: { ok: true, data: { pid: 9 } } },
+    { platform: 'win32' },
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'locate', bundle: 'notepad' }), {
+    bundle: 'notepad.exe',
+    name: 'notepad',
+    program: 'notepad.exe',
+  });
+  await assert.rejects(
+    desktop.helper.request({ op: 'open', bundle: 'logoff' }),
+    /not a windowed app/,
+  );
+  assert.deepEqual(await desktop.helper.request({ op: 'open', bundle: 'notepad' }), { pid: 9 });
+  assert.deepEqual(await desktop.calls(), [`launch ${join(root, 'System32', 'notepad.exe')}`]);
+});
+
+test('computer use keeps no focus session when the window cannot come to the front', async (t) => {
+  const desktop = await fakeDesktop(t, {
+    'list-windows': mailWindow,
+    'focus-window': refused('ACTION_NOT_SUPPORTED', 'focus-window is unavailable in this session'),
+    'press cmd+n': refused('STALE_REF', "The named window's exact focus could not be confirmed"),
+  });
+  const key = { op: 'key', keys: 'cmd+n', app: 'Mail', window: 'w-1' };
+  await assert.rejects(desktop.helper.request(key), /ACTION_NOT_SUPPORTED/);
+  assert.equal(desktop.events.at(-1), 'hidden');
+  await assert.rejects(desktop.helper.request(key), /ACTION_NOT_SUPPORTED/);
+  assert.deepEqual(
+    (await desktop.calls()).filter((call) => call.startsWith('focus-window')),
+    ['focus-window --app Mail --window-id w-1', 'focus-window --app Mail --window-id w-1'],
+  );
+  assert.equal(
+    (await desktop.calls()).some((call) => call.includes('--headed')),
+    false,
+  );
 });
 
 async function updateDownloadFixture(t) {

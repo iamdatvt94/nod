@@ -46,6 +46,7 @@ export type ApprovalState = 'pending' | 'working' | 'done' | 'declined' | 'expir
 export interface MessageApproval {
   id: string;
   state: ApprovalState;
+  failure?: string;
   title: string;
   app: string;
   slug: string;
@@ -205,6 +206,7 @@ export interface CredentialRequest {
   methods?: { id: string; label: string }[];
   fields?: { kind: 'identifier' | 'password' | 'otp'; selector: string; label: string }[];
   status: 'pending' | 'entering' | 'uncertain' | 'filled' | 'expired';
+  notEntered?: boolean;
   savedEntries?: (VaultLoginEntry & { username: string })[];
   username?: string;
   passwordManager?: { name: string; account?: string };
@@ -265,6 +267,7 @@ export interface Configuration {
 }
 export interface AppState {
   chatRecovery?: { turnId: string };
+  chatClearedAt?: string;
   tasks?: Task[];
   threadId: string;
   hasEarlierMessages?: boolean;

@@ -21,13 +21,13 @@ import type {
   MessagingAttachment,
   MessagingTransport,
 } from '../ports/messaging.ts';
-import { loopbackHost } from '../shared/loopback.ts';
 import type { ChatConfirmationInput } from './approvals.ts';
-import { appPagePath, appPages, appPageUrl } from '../shared/app-links.ts';
+import { channelText } from './channel-text.ts';
+import { appPages } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 
 const replyCommand = /^\/(memory|context|usage)(?:@[A-Za-z0-9_]+)?$/i;
-const taskCommand = /^\/(tasks|status|stop)(?:@[A-Za-z0-9_]+)?$/i;
+const taskCommand = /^\/(tasks|status|stop|clear)(?:@[A-Za-z0-9_]+)?$/i;
 
 export type ChannelPresentation =
   | {
@@ -121,9 +121,10 @@ interface ChannelOptions {
   ) => Promise<{ text: string; attachments: Artifact[]; presentation?: ChannelPresentation }>;
   taskCommand?: (
     client: PoolClient,
-    command: 'tasks' | 'status' | 'stop',
+    command: 'tasks' | 'status' | 'stop' | 'clear',
     replyToMessageId?: string,
     hasReply?: boolean,
+    channel?: string,
   ) => Promise<{
     threadId: string;
     replies: Array<{ text: string; replyToMessageId?: string; presentation?: ChannelPresentation }>;
@@ -208,55 +209,6 @@ function inboundMessageId(ownerId: string, sourceId: string) {
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const id = bytes.subarray(0, 16).toString('hex');
   return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
-}
-
-function channelText(text: string) {
-  let secureAction = false;
-  let artifact = false;
-  const privateUrl = (value: string) => {
-    let url: URL;
-    try {
-      url = new URL(value, 'https://nod.invalid');
-    } catch {
-      return false;
-    }
-    if (url.pathname.startsWith('/api/artifacts/')) {
-      artifact = true;
-      return true;
-    }
-    if (loopbackHost(url.hostname)) {
-      secureAction = true;
-      return true;
-    }
-    if (
-      /^\/(?:vault|credentials|payments|approvals)\//.test(url.pathname) ||
-      url.pathname === '/browser' ||
-      (['/vault', '/trust'].includes(url.pathname) && url.searchParams.has('add'))
-    ) {
-      if (!/^https?:\/\//.test(value)) {
-        secureAction = true;
-        return true;
-      }
-    }
-    return false;
-  };
-  const safe = text
-    .replace(
-      /\[((?:\\.|[^\]\\])*)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g,
-      (match, label: string, url: string) => {
-        const path = appPagePath(url);
-        if (path) {
-          const page = appPages[path as keyof typeof appPages];
-          return `${page && label !== page ? `${label} (${page})` : label}: ${appPageUrl(path)}`;
-        }
-        return privateUrl(url) ? label : match;
-      },
-    )
-    .replace(
-      /https?:\/\/[^\s)]+|\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)[^\s)]*/g,
-      (url) => (privateUrl(url) ? '' : url),
-    );
-  return { text: safe.trim(), secureAction, artifact };
 }
 
 async function presentChannelText(
@@ -410,7 +362,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ) {
     const replyId = randomUUID();
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id) VALUES($1,$2,'assistant',$3,$4,$5,$6)",
+      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id,created_at) VALUES($1,$2,'assistant',$3,$4,$5,$6,clock_timestamp())",
       [
         replyId,
         ownerId,
@@ -991,7 +943,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const command =
       !pending.attachments?.length && options.taskCommand
         ? (taskCommand.exec(pending.text.trim())?.[1]?.toLowerCase() as
-            'tasks' | 'status' | 'stop' | undefined)
+            'tasks' | 'status' | 'stop' | 'clear' | undefined)
         : undefined;
     const retiredAnswer =
       permittedBeforeAnswer && retiredBeforeAnswer && hiddenBeforeAnswer && !command
@@ -1073,6 +1025,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           command,
           retiredBeforeAnswer ? undefined : replyToMessageId,
           retiredBeforeAnswer ? command === 'stop' : Boolean(row.provider_reply_id),
+          channel,
         );
         for (const message of reply.replies)
           await saveReply(client, row.source_id, reply.threadId, message);
@@ -1900,6 +1853,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     drain,
     close,
     replaceTransport,
+    canDeliverLiteral(channel: string, text: string, literal: string) {
+      const channelId = channel.split(':')[0]!;
+      return (
+        !closed &&
+        !replacing &&
+        (transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false)
+      );
+    },
     announcePairing,
     react,
     async pairing() {

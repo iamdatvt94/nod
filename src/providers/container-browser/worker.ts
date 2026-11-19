@@ -79,7 +79,7 @@ async function dispatch(
       return image?.toString('base64') ?? null;
     }
     case 'currentPage':
-      return computer.currentPage(request.threadId, request.input);
+      return computer.currentPage(request.threadId, request.input, signal);
     case 'signInMethods':
       if (!computer.signInMethods) throw new Error('Sign-in choices are not available.');
       return computer.signInMethods(request.threadId, request.origin, request.methods, signal);
@@ -88,9 +88,9 @@ async function dispatch(
       await computer.selectSignInMethod(request.threadId, request.input, signal);
       return null;
     case 'injectCredentials':
-      return computer.injectCredentials(request.input);
+      return computer.injectCredentials(request.input, signal);
     case 'fillCard':
-      await computer.fillCard(request.input);
+      await computer.fillCard(request.input, signal);
       return null;
     case 'cardDestinations':
       return computer.cardDestinations(request.threadId, request.fields);

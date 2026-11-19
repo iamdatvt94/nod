@@ -136,6 +136,7 @@ export async function startStack(options: {
   model: Model;
   backgroundModel?: string;
   integrations: IntegrationProvider;
+  desktop?: import('../../src/ports/desktop.ts').DesktopControl;
   observations?: import('../../src/ports/proactivity.ts').ObservationProvider[];
   proactiveBaseline?: boolean;
   siteHosts: string[];
@@ -520,6 +521,7 @@ export async function startStack(options: {
           lightest: true,
         }),
         linkPreviews: createPublicLinkPreviewProvider(),
+        ...(options.desktop ? { desktop: options.desktop } : {}),
         model: { provider: model.provider, name: model.name, configured: true },
         ...(home
           ? {

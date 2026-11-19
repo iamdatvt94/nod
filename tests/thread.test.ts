@@ -41,6 +41,7 @@ import type { ThreadDependencies } from '../src/server/thread.ts';
 import type {
   Artifact,
   Connection,
+  Message,
   SubmitMessageResponse,
   Task,
   Turn,
@@ -2605,6 +2606,113 @@ test(
         }
       });
 
+      await t.test('task checks exclude withdrawn requests from model input', async (t) => {
+        await waitFor(settledThread);
+        const previousChecks = dependencies.taskChecks;
+        dependencies.taskChecks = undefined;
+        t.after(() => {
+          dependencies.taskChecks = previousChecks;
+        });
+        for (const [status, withdrawn, copied] of [
+          ['succeeded', false, false],
+          ['cancelled', false, false],
+          ['cancelled', true, false],
+          ['failed', true, false],
+          ['succeeded', false, true],
+        ] as const) {
+          await t.test(`${status}, withdrawn=${withdrawn}, copied=${copied}`, async () => {
+            const id = randomUUID();
+            const turnId = randomUUID();
+            const messageId = randomUUID();
+            const prompt = `Synthetic task request ${id}`;
+            await db.pool.query(
+              `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn,message_id)
+               VALUES($1,$2,$3,$4,'user',$5,$6,true,now(),now(),$7,$8)`,
+              [turnId, ownerId, threadId, id, prompt, status, withdrawn, messageId],
+            );
+            await db.pool.query(
+              "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'user',$5)",
+              [messageId, ownerId, threadId, turnId, prompt],
+            );
+            if (copied) {
+              const original = randomUUID();
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn)
+                 VALUES($1,$2,$3,$4,'user',$5,'failed',true,now()-interval '1 minute',now()-interval '1 minute',true)`,
+                [original, ownerId, threadId, id, prompt],
+              );
+              await db.pool.query(
+                "UPDATE turns SET source='resume',parent_turn_id=$2,prompt=$3,message_id=NULL WHERE id=$1",
+                [turnId, original, `Synthetic old check\nThe request was: ${prompt}`],
+              );
+              await db.pool.query('UPDATE messages SET turn_id=$2 WHERE id=$1', [
+                messageId,
+                original,
+              ]);
+            }
+            await db.pool.query(
+              `INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,next_check)
+               VALUES($1,$2,$3,$1,'Synthetic tracked work','Synthetic reply arrived','Waiting',date_trunc('milliseconds',now())-interval '1 minute')`,
+              [id, ownerId, turnId],
+            );
+            t.after(async () => {
+              await request('POST', `/api/tasks/${id}/stop`);
+              await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [id]);
+              await db.pool.query('DELETE FROM tasks WHERE id=$1', [id]);
+            });
+            await Promise.all([tasks.resumeDue(threadId), tasks.resumeDue(threadId)]);
+            const checks = (
+              await db.pool.query<{ id: string; prompt: string; parent_turn_id: string }>(
+                "SELECT id,prompt,parent_turn_id FROM turns WHERE session_id=$1 AND source_id LIKE 'task-check:%'",
+                [id],
+              )
+            ).rows;
+            assert.equal(checks.length, 1);
+            const check = checks[0]!;
+            assert.equal(check.parent_turn_id, turnId);
+            assert.equal(check.prompt.includes(prompt), !withdrawn && !copied);
+            await waitFor(settled(check.id));
+            const context = ran(check.id)!;
+            assert.equal(context.sessionId, id);
+            assert.equal(context.prompt.includes(prompt), !withdrawn && !copied);
+            assert.equal(
+              context.history.some(({ text }) => text === prompt),
+              !withdrawn && !copied,
+            );
+            if (withdrawn)
+              assert.equal(context.withdrawnRequest, status === 'failed' ? 'failed' : 'stopped');
+            const saved = (
+              await db.pool.query('SELECT next_check,state FROM tasks WHERE id=$1', [id])
+            ).rows[0];
+            assert.equal(saved.next_check, null);
+            assert.equal(saved.state, 'open');
+            const detail = await request('GET', '/api/tasks');
+            assert.equal(detail.statusCode, 200);
+            assert.equal(JSON.stringify(detail.json()).includes(prompt), false);
+            if (copied) {
+              const renewed = randomUUID();
+              const renewedPrompt = 'Synthetic new owner request';
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,prompt,status,background,started_at,finished_at)
+                 VALUES($1,$2,$3,$4,$5,'user',$6,'succeeded',true,now(),now())`,
+                [renewed, ownerId, threadId, id, check.id, renewedPrompt],
+              );
+              await thread.resumeTurn(renewed, `synthetic-renewed:${id}`, 'Synthetic new check');
+              const next = (
+                await db.pool.query<{ id: string; prompt: string }>(
+                  'SELECT id,prompt FROM turns WHERE source_id=$1',
+                  [`synthetic-renewed:${id}`],
+                )
+              ).rows[0]!;
+              assert.equal(next.prompt.includes(renewedPrompt), true);
+              assert.equal(next.prompt.includes(prompt), false);
+              await waitFor(settled(next.id));
+              assert.equal(ran(next.id)!.prompt.includes(renewedPrompt), true);
+            }
+          });
+        }
+      });
+
       await t.test('a failed task check enqueue keeps its planned time', async (t) => {
         await waitFor(settledThread);
         const previousChecks = dependencies.taskChecks;
@@ -2734,6 +2842,65 @@ test(
         assert.equal(await turnStatus(background), 'failed');
         assert.equal(ran(background), undefined);
       });
+
+      await t.test(
+        'a failed usage check leaves queued input separate from a completed response',
+        async () => {
+          const prompt = `usage-intake-${randomUUID()}`;
+          const originalRun = dependencies.runTurn;
+          const originalLimit = dependencies.spendingLimit;
+          let unavailable = false;
+          block(prompt);
+          dependencies.spendingLimit = async () => {
+            if (unavailable) throw new Error('Synthetic usage persistence unavailable.');
+            return (await originalLimit?.()) ?? null;
+          };
+          dependencies.runTurn = async (context) => {
+            if (context.prompt !== prompt) return originalRun(context);
+            runs.push(context);
+            await waiting.get(prompt);
+            unavailable = true;
+            try {
+              assert.deepEqual(await context.takeMessages!(), []);
+            } finally {
+              unavailable = false;
+            }
+            await context.reply('The first synthetic result is complete.');
+            return { status: 'succeeded' };
+          };
+          try {
+            const first = await thread.submitUserMessage(prompt);
+            await waitFor(() => Boolean(ran(first.turnId)));
+            const queued = await thread.submitUserMessage('Keep this synthetic request separate.');
+            assert.equal(await turnStatus(queued.turnId), 'queued');
+            release(prompt);
+            await waitFor(settled(first.turnId));
+            await waitFor(settled(queued.turnId));
+            assert.equal(await turnStatus(first.turnId), 'succeeded');
+            assert.equal(await turnStatus(queued.turnId), 'succeeded');
+            assert.ok(ran(queued.turnId));
+            assert.equal(
+              (await db.pool.query('SELECT turn_id FROM messages WHERE id=$1', [queued.messageId]))
+                .rows[0].turn_id,
+              queued.turnId,
+            );
+            assert.equal(
+              (
+                await db.pool.query(
+                  "SELECT count(*)::int AS count FROM messages WHERE turn_id=$1 AND text='The first synthetic result is complete.'",
+                  [first.turnId],
+                )
+              ).rows[0].count,
+              1,
+            );
+          } finally {
+            unavailable = false;
+            release(prompt);
+            dependencies.runTurn = originalRun;
+            dependencies.spendingLimit = originalLimit;
+          }
+        },
+      );
 
       await t.test('a scheduled turn continues when cache policy lookup fails', async (t) => {
         const previous = dependencies.scheduleCache;
@@ -6345,6 +6512,415 @@ test(
           }
         },
       );
+
+      await t.test(
+        'clear starts fresh chat without a model and keeps independent work',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const earlierPrompt = 'Synthetic earlier chat before clear';
+          const earlier = await thread.submitUserMessage(earlierPrompt);
+          await waitFor(settled(earlier.turnId));
+          const backgroundPrompt = 'Synthetic independent work during clear';
+          const runningPrompt = 'Synthetic current chat before clear';
+          const nextPrompt = 'Synthetic new request after clear';
+          block(backgroundPrompt);
+          block(runningPrompt);
+          modelErrors.set('/clear', 'Synthetic unavailable model');
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          const running = await thread.submitUserMessage(runningPrompt);
+          try {
+            await waitFor(() => Boolean(ran(background)) && Boolean(ran(running.turnId)));
+            const independent = ran(background)!;
+            const file = join(independent.workspacePath, 'clear-kept.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const clientMessageId = randomUUID();
+            const clear = () =>
+              request('POST', '/api/messages', {
+                threadId,
+                text: '/clear',
+                clientMessageId,
+              });
+            const [response, concurrent] = await Promise.all([clear(), clear()]);
+            assert.equal(response.statusCode, 200, response.body);
+            const cleared = response.json() as SubmitMessageResponse;
+            assert.deepEqual(concurrent.json(), cleared);
+            assert.equal(await turnStatus(cleared.turnId), 'succeeded');
+            await waitFor(settled(cleared.turnId));
+            assert.equal(Boolean(ran(cleared.turnId)), false);
+            assert.equal(await turnStatus(running.turnId), 'cancelled');
+            assert.equal(independent.signal.aborted, false);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const state = (await request('GET', '/api/state')).json();
+            assert.equal(state.threadId, threadId);
+            assert.equal(typeof state.chatClearedAt, 'string');
+            assert.equal(
+              state.messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (
+                await request(
+                  'GET',
+                  '/api/messages/search?q=Synthetic%20earlier%20chat%20before%20clear',
+                )
+              )
+                .json()
+                .some((message: Message) => message.id === earlier.messageId),
+              true,
+            );
+            assert.equal(
+              (await personal.recall(earlierPrompt, undefined, null)).some(
+                ({ id }) => id === earlier.messageId,
+              ),
+              false,
+            );
+            block(nextPrompt);
+            const next = await thread.submitUserMessage(nextPrompt);
+            await waitFor(() => Boolean(ran(next.turnId)));
+            const context = ran(next.turnId)!;
+            assert.ok(context.contextRestart);
+            assert.equal(
+              context.history.some(({ text }) => text === earlierPrompt),
+              false,
+            );
+            assert.deepEqual((await clear()).json(), cleared);
+            assert.equal(context.signal.aborted, false);
+            assert.equal(await turnStatus(next.turnId), 'running');
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId: randomUUID(),
+                  text: '/clear',
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              409,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  clientMessageId: earlier.messageId,
+                })
+              ).statusCode,
+              409,
+            );
+            release(nextPrompt);
+            await waitFor(settled(next.turnId));
+            const attachment = await storeArtifact(
+              Buffer.from('Synthetic clear attachment'),
+              'clear.txt',
+              'text/plain',
+              threadId,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  attachmentIds: [attachment.id],
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              400,
+            );
+            assert.equal(
+              (await sendAudio({ threadId, text: '/clear', clientMessageId: randomUUID() }))
+                .statusCode,
+              400,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: 'Synthetic stale client input',
+                  clientMessageId: randomUUID(),
+                  chatClearedAt: null,
+                })
+              ).statusCode,
+              409,
+            );
+            const arrival = thread.stopSignal();
+            await db.pool
+              .query(`CREATE FUNCTION reject_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+              IF NEW.text='/clear' THEN RAISE EXCEPTION 'Synthetic clear failure'; END IF;
+              RETURN NEW; END $$;
+              CREATE TRIGGER reject_clear BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION reject_clear()`);
+            try {
+              assert.equal(
+                (
+                  await request('POST', '/api/messages', {
+                    threadId,
+                    text: '/clear',
+                    clientMessageId: randomUUID(),
+                  })
+                ).statusCode,
+                500,
+              );
+            } finally {
+              await db.pool.query(
+                'DROP TRIGGER reject_clear ON messages; DROP FUNCTION reject_clear()',
+              );
+            }
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            const afterRollback = await thread.submitUserMessage(
+              'Synthetic input after failed clear',
+              [],
+              {
+                stopSignal: arrival,
+              },
+            );
+            await waitFor(settled(afterRollback.turnId));
+            assert.equal(await turnStatus(afterRollback.turnId), 'succeeded');
+          } finally {
+            modelErrors.delete('/clear');
+            release(backgroundPrompt);
+            release(runningPrompt);
+            release(nextPrompt);
+            await waitFor(settled(background));
+            await waitFor(settled(running.turnId));
+          }
+        },
+      );
+
+      await t.test(
+        'clear cancels earlier text and audio intake but keeps an addressed task reply',
+        async (t) => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const taskId = randomUUID();
+          const anchor = randomUUID();
+          const origin = await thread.enqueueTurn('Synthetic task before clear intake', {
+            source: 'task',
+            sessionId: taskId,
+            background: true,
+          });
+          await waitFor(settled(origin));
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant','Synthetic task question')",
+            [anchor, ownerId, threadId, origin],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,message_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,$4,'Synthetic independent task','Synthetic reply arrived','Waiting',1)",
+            [taskId, ownerId, origin, anchor],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$1 WHERE id=$2', [taskId, origin]);
+          const statusMessage = randomUUID();
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,role,text,reply_to_message_id) VALUES($1,$2,$3,'assistant','Synthetic task status',$4)",
+            [statusMessage, ownerId, threadId, anchor],
+          );
+          const mainText = 'Synthetic main input still being read';
+          const taskText = 'Synthetic addressed task input still being read';
+          const reading = new Set<string>();
+          let releaseReading!: () => void;
+          const held = new Promise<void>((resolve) => {
+            releaseReading = resolve;
+          });
+          const accept = verification.accept.bind(verification);
+          t.mock.method(verification, 'accept', async (...args: Parameters<typeof accept>) => {
+            if (args[0] === mainText || args[0] === taskText) {
+              reading.add(args[0]);
+              await held;
+              return undefined;
+            }
+            return accept(...args);
+          });
+          let releaseAudio!: () => void;
+          transcriptionGate = new Promise<void>((resolve) => {
+            releaseAudio = resolve;
+          });
+          const previousTranscript = transcript;
+          const previousReady = chatReady;
+          transcript = 'Synthetic audio input before clear';
+          const audioCount = transcriptions.length;
+          const mainMessageId = randomUUID();
+          const audioMessageId = randomUUID();
+          const artifactCount = (await db.pool.query('SELECT count(*)::int AS n FROM artifacts'))
+            .rows[0].n;
+          const main = request('POST', '/api/messages', {
+            threadId,
+            text: mainText,
+            clientMessageId: mainMessageId,
+          }).then((response) => response);
+          const task = request('POST', '/api/messages', {
+            threadId,
+            text: taskText,
+            clientMessageId: randomUUID(),
+            replyToMessageId: statusMessage,
+            chatClearedAt: null,
+          }).then((response) => response);
+          const audio = sendAudio({ threadId, clientMessageId: audioMessageId }).then(
+            (response) => response,
+          );
+          try {
+            await waitFor(() => reading.size === 2 && transcriptions.length > audioCount);
+            chatReady = false;
+            const cleared = await request('POST', '/api/messages', {
+              threadId,
+              text: '/clear',
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(cleared.statusCode, 200, cleared.body);
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            const [mainResult, taskResult, audioResult] = await Promise.all([main, task, audio]);
+            for (const response of [mainResult, audioResult]) {
+              assert.equal(response.statusCode, 409, response.body);
+              assert.equal(response.json().retryable, true);
+            }
+            assert.equal(
+              (
+                await db.pool.query('SELECT id FROM messages WHERE id=ANY($1::uuid[])', [
+                  [mainMessageId, audioMessageId],
+                ])
+              ).rowCount,
+              0,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT count(*)::int AS n FROM artifacts')).rows[0].n,
+              artifactCount,
+            );
+            assert.equal(
+              (
+                await db.pool.query('SELECT response FROM audio_messages WHERE message_id=$1', [
+                  audioMessageId,
+                ])
+              ).rows[0].response,
+              null,
+            );
+            const freshState = (await request('GET', '/api/state')).json();
+            assert.equal(
+              freshState.messages.some(
+                (message: Message) => message.id === mainMessageId || message.id === audioMessageId,
+              ),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some(
+                  (message: Message) =>
+                    message.id === mainMessageId || message.id === audioMessageId,
+                ),
+              false,
+            );
+            assert.equal(taskResult.statusCode, 200, taskResult.body);
+            const continued = taskResult.json().turnId as string;
+            await waitFor(settled(continued));
+            assert.equal(ran(continued)!.sessionId, taskId);
+            assert.equal(ran(continued)!.prompt, taskText);
+            assert.equal(await turnStatus(continued), 'succeeded');
+            transcriptionGate = undefined;
+            assert.equal(
+              (await sendAudio({ threadId, clientMessageId: audioMessageId })).statusCode,
+              409,
+            );
+            const resent = await sendAudio({ threadId, clientMessageId: randomUUID() });
+            assert.equal(resent.statusCode, 200, resent.body);
+            await waitFor(settled(resent.json().turnId));
+          } finally {
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            await Promise.allSettled([main, task, audio]);
+            transcriptionGate = undefined;
+            transcript = previousTranscript;
+            await request('POST', `/api/tasks/${taskId}/stop`);
+            await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [taskId]);
+            await db.pool.query('DELETE FROM tasks WHERE id=$1', [taskId]);
+          }
+        },
+      );
+
+      await t.test('chat-app clear saves one visible acknowledgement in Nod', async () => {
+        const { createChannels } = await import('../src/server/channels.ts');
+        const threadId = (await thread.activeThread()).id;
+        for (const provider of ['telegram', 'whatsapp']) {
+          let pending = true;
+          const posts: string[] = [];
+          const channels = await createChannels(db.pool, {
+            ownerId,
+            transport: {
+              channels: [
+                {
+                  id: provider,
+                  status: 'configured',
+                  missing: [],
+                  accountId: 'synthetic-clear',
+                  allowedSenderIds: ['111'],
+                },
+              ],
+              poll: async (accept) => {
+                if (!pending) return;
+                pending = false;
+                await accept({
+                  channelId: provider,
+                  accountId: 'synthetic-clear',
+                  senderId: '111',
+                  messageId: randomUUID(),
+                  threadId: 'synthetic-chat',
+                  text: '/clear',
+                  sentAt: new Date(),
+                });
+              },
+              receive: async () => ({ status: 200, body: {} }),
+              post: async ({ text }) => {
+                posts.push(text);
+                return { id: 'synthetic-sent-clear' };
+              },
+              close: async () => {},
+            },
+            subscribe: () => () => {},
+            intervalMs: 600_000,
+            activeThread: (client) => thread.activeThread(client),
+            taskCommand: tasks.chatCommand,
+            submit: async () => {
+              throw new Error('Clear must not start a model turn.');
+            },
+          });
+          try {
+            await channels.drain();
+            assert.deepEqual(posts, [thread.chatClearedMessage]);
+            for (const path of ['/api/state', '/api/messages']) {
+              const messages = (await request('GET', path)).json().messages as Message[];
+              assert.equal(
+                messages.filter(
+                  ({ role, text }) => role === 'assistant' && text === thread.chatClearedMessage,
+                ).length,
+                1,
+              );
+            }
+            const boundary = (await request('GET', '/api/state')).json().chatClearedAt;
+            await channels.drain();
+            assert.equal(posts.length, 1);
+            assert.equal((await request('GET', '/api/state')).json().chatClearedAt, boundary);
+            assert.equal((await thread.activeThread()).id, threadId);
+          } finally {
+            await channels.close();
+          }
+        }
+      });
 
       await t.test(
         'a context restart keeps chat, files and independent work and refuses stale requests',

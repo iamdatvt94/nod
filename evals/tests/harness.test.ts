@@ -13,6 +13,8 @@ import { createAgentRuntime } from '../../src/runtime/index.ts';
 import { runProcess } from '../../src/providers/process.ts';
 import { accessCookie, registerLocalAccess } from '../../src/server/access.ts';
 import { createAccountSession } from '../../src/server/account.ts';
+import { createComputerUse } from '../../src/server/computer-use.ts';
+import { createDesktop, textEdit } from '../src/world/desktop.ts';
 import { waitingTurnSql } from '../../src/server/turn-chain.ts';
 import type { AccountSettings } from '../../src/shared/account.ts';
 import { fakeComputer, fakeWorkspace } from '../../tests/runtime-fixtures.ts';
@@ -88,6 +90,32 @@ import { paymentScenario } from '../src/world/checkout.ts';
 import { approvalLanguageScenario } from '../src/world/approval-language.ts';
 import { ambiguousDelegationScenario } from '../src/world/ambiguous-delegation.ts';
 import { discoveryCase } from '../src/world/discovery.ts';
+
+test('the desktop fixture supports checked creation of a first document and keyboard input', async () => {
+  const app = textEdit();
+  const desktop = createDesktop([app]);
+  const pool = {
+    query: async (sql: string) => ({
+      rows: sql.startsWith('SELECT computer_use')
+        ? [{ computer_use: true, computer_keep_out: [] }]
+        : [{ id: 'root', source: 'user', message_id: 'message', proactive: false }],
+    }),
+  } as unknown as Parameters<typeof createComputerUse>[0];
+  const computer = createComputerUse(pool, 'owner', { platform: 'darwin', desktop });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  const run = async (
+    action: Parameters<typeof computer.prepare>[1],
+    args: Record<string, unknown>,
+  ) => computer.execute(turn, action, await computer.prepare(turn, action, args));
+  await run('COMPUTER_OPEN', { bundle: app.bundle });
+  const menu = (await run('COMPUTER_SNAPSHOT', { pid: 500, menu: true })) as { tree: string };
+  const ref = /menuitem "New" (@[a-z0-9]+:e\d+)/.exec(menu.tree)?.[1];
+  assert.ok(ref);
+  await run('COMPUTER_PRESS', { ref });
+  assert.equal(app.windows.length, 1);
+  await run('COMPUTER_KEY', { pid: 500, keys: 'cmd+n' });
+  assert.equal(app.windows.length, 2);
+});
 
 test('a scripted greeting reply answers only the opening question', async () => {
   const definition = discoveryCase('greeting');

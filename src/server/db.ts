@@ -69,6 +69,7 @@ export async function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS threads_active_owner ON threads(owner_id) WHERE archived_at IS NULL;
     ALTER TABLE threads ADD COLUMN IF NOT EXISTS observer_session_id uuid NOT NULL DEFAULT gen_random_uuid();
     ALTER TABLE threads ADD COLUMN IF NOT EXISTS chat_restarted_at timestamptz;
+    ALTER TABLE threads ADD COLUMN IF NOT EXISTS chat_cleared_at timestamptz;
     CREATE TABLE IF NOT EXISTS turns (
       id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL REFERENCES threads(id),
       session_id uuid NOT NULL, source text NOT NULL, source_id text, message_id uuid, prompt text NOT NULL,
@@ -178,6 +179,8 @@ export async function initializeDatabase() {
     ALTER TABLE preferences ALTER COLUMN proactive_paused SET DEFAULT true;
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_keep_out text[] NOT NULL DEFAULT '{}';
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_files_enabled boolean NOT NULL DEFAULT false;
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS computer_use boolean NOT NULL DEFAULT false;
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS computer_keep_out text[] NOT NULL DEFAULT '{}';
     CREATE INDEX IF NOT EXISTS messages_owner_time ON messages(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_thread_time ON messages(thread_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_turn_time ON messages(turn_id,created_at);

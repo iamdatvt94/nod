@@ -673,20 +673,25 @@ export function createPiAgent(options: {
       const compactTools = [
         ...sandboxTools.map((tool) => tool.name),
         'nod_tool_search',
-        ...(input.tools.some((tool) => tool.name === 'apps') ? ['apps'] : []),
+        ...['apps', 'send_message'].filter((name) =>
+          input.tools.some((tool) => tool.name === name),
+        ),
       ];
       const tools: ToolDefinition[] = [
         ...sandboxTools.map((definition): ToolDefinition => ({
           ...definition,
           execute: async (id, params, signal, onUpdate, context) => {
+            params = structuredClone(params);
             const result = await input.runTool(
               definition.name,
               params,
-              async () => {
-                const output = await definition.execute(id, params, signal, onUpdate, context);
+              async (operation = signal) => {
+                const callSignal =
+                  operation && signal ? AbortSignal.any([signal, operation]) : operation;
+                const output = await definition.execute(id, params, callSignal, onUpdate, context);
                 const bounded = id.includes('/')
                   ? output
-                  : await boundedOutput(definition.name, async () => output, signal);
+                  : await boundedOutput(definition.name, async () => output, callSignal);
                 if (definition.name !== 'bash') return bounded;
                 const exitCode = (output.structuredContent as { exit_code?: unknown } | undefined)
                   ?.exit_code;

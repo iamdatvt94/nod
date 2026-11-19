@@ -69,6 +69,7 @@ import {
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import { createDiscoveredOAuth } from '../src/providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from '../src/server/discovered-connections.ts';
+import { transaction } from '../src/server/transaction.ts';
 import { registerLocalAccess } from '../src/server/access.ts';
 import { createIntegrations, initializeIntegrationSchema } from '../src/server/integrations.ts';
 import { cachedIcons } from '../src/server/link-previews.ts';
@@ -7577,6 +7578,47 @@ test(
 );
 
 test(
+  'an action the connection service does not offer is refused before any app request',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    await f.connect('slack');
+    f.sessions.length = 0;
+    let offered: boolean | Error = false;
+    f.session.offers = async () => {
+      if (offered instanceof Error) throw offered;
+      return offered;
+    };
+    await assert.rejects(
+      f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE'),
+      (error: Error & { statusCode?: number }) => {
+        assert.equal(error.statusCode, 404);
+        assert.ok(error.message.includes('SLACK_POST_MESSAGE'));
+        return true;
+      },
+    );
+    assert.equal(f.sessions.length, 1);
+    assert.equal(f.executed.length, 0);
+    offered = new Error('lookup unavailable');
+    await f.service.assertOffered('local-development', 'SLACK_POST_MESSAGE');
+    offered = true;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    offered = false;
+    const lookups = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_SEND_MESSAGE');
+    t.mock.method(f.session, 'search', async () => ({
+      tools: { SLACK_FIND_CHANNELS: {} },
+      suggestions: [],
+    }));
+    await f.service.execute('local-development', 'SEARCH_TOOLS', { query: 'find channels' });
+    const searched = f.sessions.length;
+    await f.service.assertOffered('local-development', 'SLACK_FIND_CHANNELS');
+    assert.equal(lookups, 3);
+    assert.equal(f.sessions.length, searched);
+  },
+);
+
+test(
   'ordinary account-scoped discovery excludes other accounts from the provider session',
   { skip: !process.env.TEST_DATABASE_URL },
   async (t) => {
@@ -9950,6 +9992,552 @@ test(
 );
 
 test(
+  'HTTP confirmation context keeps the exact request and connection binding',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    const schema = `test_http_context_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    try {
+      const owner = 'synthetic-http-context-owner';
+      const key = randomBytes(32);
+      const grantVault = await createAppGrantVault(pool, {
+        ownerId: owner,
+        keyStore: { id: 'fixture', configured: true, getKey: async () => key },
+      });
+      const calls: unknown[] = [];
+      const discovered = await createDiscoveredConnections(pool, {
+        ownerId: owner,
+        baseUrl: 'http://localhost:4310',
+        grantVault,
+        transport: {
+          validateEndpoint: async (value) => value,
+          http: async (url, headers, method, body) => {
+            assert.equal(headers.Authorization, 'Bearer synthetic-http-context-secret');
+            calls.push({ url, method, body });
+            return { status: 200, body: { records: 2 } };
+          },
+          listTools: async () => assert.fail('HTTP context must not load an MCP catalog.'),
+          callTool: async () => assert.fail('HTTP context must not call an MCP tool.'),
+        },
+        oauth: {} as Parameters<typeof createDiscoveredConnections>[1]['oauth'],
+      });
+      const connectionId = randomUUID();
+      const pathId = randomUUID();
+      const path = {
+        id: pathId,
+        kind: 'http',
+        endpoint: 'https://api.example.test/v2',
+        auth: 'bearer',
+      };
+      await pool.query(
+        'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+        [
+          connectionId,
+          owner,
+          'http-context',
+          'Synthetic HTTP API',
+          'Synthetic account',
+          JSON.stringify([path]),
+        ],
+      );
+      await grantVault.put(connectionId, 'synthetic-http-context-secret');
+      for (const [method, body] of [
+        ['GET', { ignored: true }],
+        ['POST', { label: 'Synthetic record', enabled: false }],
+        ['PUT', null],
+        ['PATCH', ['Synthetic value']],
+        ['DELETE', 0],
+      ] as const) {
+        const args = {
+          connectionId,
+          pathId,
+          method,
+          path: '/signals?route=one%2Ftwo&label=Caf%C3%A9',
+          body,
+        };
+        const details = await discovered.approvalDetails('CONNECTED_HTTP', args);
+        const expected = {
+          method,
+          url: `${path.endpoint}${args.path}`,
+          ...(method === 'GET' ? {} : { body }),
+        };
+        assert.deepEqual(details.request, expected);
+        assert.deepEqual(details.account, {
+          name: 'Synthetic HTTP API',
+          identity: 'Synthetic account',
+        });
+        assert.equal(details.verifiedBinding, await discovered.binding(connectionId));
+        assert.doesNotMatch(JSON.stringify(details), /synthetic-http-context-secret/);
+        assert.equal(calls.length, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].indexOf(method));
+        await discovered.execute(
+          'CONNECTED_HTTP',
+          args,
+          undefined,
+          undefined,
+          details.verifiedBinding,
+        );
+        assert.deepEqual(calls.at(-1), { ...expected, body: method === 'GET' ? undefined : body });
+      }
+      const args = {
+        connectionId,
+        pathId,
+        method: 'POST',
+        path: '/original',
+        body: { label: 'Original record' },
+      };
+      const pending = discovered.approvalDetails('CONNECTED_HTTP', args);
+      args.method = 'DELETE';
+      args.path = '/changed';
+      args.body.label = 'Changed record';
+      const details = await pending;
+      assert.deepEqual(details.request, {
+        method: 'POST',
+        url: `${path.endpoint}/original`,
+        body: { label: 'Original record' },
+      });
+      await pool.query(
+        'UPDATE discovered_connections SET account_id=gen_random_uuid() WHERE id=$1',
+        [connectionId],
+      );
+      await assert.rejects(
+        discovered.execute('CONNECTED_HTTP', args, undefined, undefined, details.verifiedBinding),
+        (cause: Error & { notRun?: boolean }) => {
+          assert.match(cause.message, /connected account changed/);
+          assert.equal(cause.notRun, true);
+          return true;
+        },
+      );
+      const controller = new AbortController();
+      controller.abort(new Error('synthetic_stop'));
+      await assert.rejects(
+        discovered.approvalDetails('CONNECTED_HTTP', args, controller.signal),
+        /synthetic_stop/,
+      );
+      await assert.rejects(
+        discovered.approvalDetails('CONNECTED_HTTP', { ...args, path: '../escape' }),
+        /stay in the saved API address/,
+      );
+      await pool.query('UPDATE discovered_connections SET owner_id=$2 WHERE id=$1', [
+        connectionId,
+        'another-synthetic-owner',
+      ]);
+      await assert.rejects(discovered.approvalDetails('CONNECTED_HTTP', args), /unavailable/);
+      assert.equal(calls.length, 5);
+    } finally {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  'MCP confirmation context keeps the exact catalog, owner and connection binding',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_mcp_context_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    try {
+      const owner = 'synthetic-context-owner';
+      const key = randomBytes(32);
+      const grantVault = await createAppGrantVault(pool, {
+        ownerId: owner,
+        keyStore: { id: 'fixture', configured: true, getKey: async () => key },
+      });
+      async function fixture() {
+        const connectionId = randomUUID();
+        const pathId = randomUUID();
+        let endpoint = 'https://context.example.test/mcp';
+        let listFailure = false;
+        let beforeList: (() => Promise<void>) | undefined;
+        let beforeToken:
+          ((client: Parameters<typeof grantVault.read>[1]) => Promise<void>) | undefined;
+        let lists = 0;
+        let calls = 0;
+        const paths = () => [{ id: pathId, kind: 'mcp', endpoint, auth: 'bearer' }];
+        const discovered = await createDiscoveredConnections(pool, {
+          ownerId: owner,
+          baseUrl: 'http://localhost:4310',
+          grantVault: {
+            ...grantVault,
+            read: async (id, client) => {
+              const grant = await grantVault.read(id, client);
+              await beforeToken?.(client);
+              return grant;
+            },
+          },
+          transport: {
+            validateEndpoint: async (value) => value,
+            http: async () => assert.fail('No HTTP request is expected.'),
+            callTool: async () => {
+              calls++;
+              return { content: [{ type: 'text', text: 'Synthetic rows.' }] };
+            },
+            listTools: async (address) => {
+              lists++;
+              await beforeList?.();
+              if (listFailure)
+                throw Object.assign(
+                  new Error('Synthetic catalog is unavailable: synthetic-context-secret'),
+                  { statusCode: 503, code: 'SYNTHETIC_BUSY' },
+                );
+              return {
+                tools: [
+                  {
+                    name: 'read_rows',
+                    description: `Read rows at ${address}. synthetic-context-secret`,
+                    inputSchema: { type: 'object', properties: { tableId: { type: 'string' } } },
+                  },
+                  { name: 'read_rows_status', inputSchema: {} },
+                ],
+              };
+            },
+          },
+          oauth: {} as Parameters<typeof createDiscoveredConnections>[1]['oauth'],
+        });
+        await pool.query(
+          'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+          [
+            connectionId,
+            owner,
+            'context-fixture',
+            'Synthetic MCP',
+            'Synthetic account',
+            JSON.stringify(paths()),
+          ],
+        );
+        await grantVault.put(connectionId, 'synthetic-context-secret');
+        return {
+          discovered,
+          connectionId,
+          args: { connectionId, pathId, tool: 'read_rows', input: { tableId: 'synthetic-table' } },
+          counts: () => ({ lists, calls }),
+          beforeList: (fn: () => Promise<void>) => {
+            beforeList = fn;
+          },
+          beforeToken: (fn: (client: Parameters<typeof grantVault.read>[1]) => Promise<void>) => {
+            beforeToken = fn;
+          },
+          failList: () => {
+            listFailure = true;
+          },
+          replace: async (client: Parameters<typeof grantVault.read>[1] = pool) => {
+            endpoint = 'https://replacement.example.test/mcp';
+            await client.query(
+              'UPDATE discovered_connections SET paths=$2,account_id=$3 WHERE id=$1',
+              [connectionId, JSON.stringify(paths()), randomUUID()],
+            );
+          },
+          replacePath: async () => {
+            endpoint = 'https://replacement.example.test/mcp';
+            await pool.query('UPDATE discovered_connections SET paths=$2 WHERE id=$1', [
+              connectionId,
+              JSON.stringify(paths()),
+            ]);
+          },
+        };
+      }
+      const refused = (cause: Error & { notRun?: boolean }) => {
+        assert.match(cause.message, /changed/);
+        assert.equal(cause.notRun, true);
+        return true;
+      };
+      await t.test('selects one exact tool and hides the credential', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        assert.ok(details.tool);
+        assert.equal(details.tool.name, 'read_rows');
+        assert.match(details.tool.description!, /context\.example\.test/);
+        assert.equal(JSON.stringify(details).includes('synthetic-context-secret'), false);
+        assert.equal(details.account.identity, 'Synthetic account');
+        assert.equal(details.verifiedBinding, await f.discovered.binding(f.connectionId));
+        for (const args of [
+          { ...f.args, tool: 'READ_ROWS' },
+          { ...f.args, tool: 'read_row' },
+          { ...f.args, pathId: randomUUID() },
+          { ...f.args, connectionId: randomUUID() },
+        ])
+          await assert.rejects(
+            f.discovered.approvalDetails('CONNECTED_MCP_CALL', args),
+            /unavailable/,
+          );
+        await pool.query('UPDATE discovered_connections SET owner_id=$2 WHERE id=$1', [
+          f.connectionId,
+          'another-synthetic-owner',
+        ]);
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          /unavailable/,
+        );
+        assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+      });
+      await t.test('a replaced endpoint with the same path ID gets its own catalog', async () => {
+        const f = await fixture();
+        const first = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        await f.replacePath();
+        const second = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        assert.ok(second.tool);
+        assert.match(second.tool.description!, /replacement\.example\.test/);
+        assert.notEqual(first.verifiedBinding, second.verifiedBinding);
+        assert.equal(f.counts().lists, 2);
+      });
+      await t.test('failed refreshes do not approve with an expired catalog', async (t) => {
+        const f = await fixture();
+        await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        const now = Date.now();
+        t.mock.method(Date, 'now', () => now + 11 * 60_000);
+        f.failList();
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          (cause: Error & { notRun?: boolean }) => {
+            assert.match(cause.message, /status 503; code SYNTHETIC_BUSY/);
+            assert.match(cause.message, /Synthetic catalog is unavailable/);
+            assert.equal(JSON.stringify(cause).includes('synthetic-context-secret'), false);
+            assert.equal(cause.message.includes('synthetic-context-secret'), false);
+            assert.equal(cause.notRun, true);
+            return true;
+          },
+        );
+        await assert.rejects(
+          f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args),
+          (cause: Error & { notRun?: boolean }) => {
+            assert.match(cause.message, /status 503; code SYNTHETIC_BUSY/);
+            assert.match(cause.message, /Synthetic catalog is unavailable/);
+            assert.equal(JSON.stringify(cause).includes('synthetic-context-secret'), false);
+            assert.equal(cause.message.includes('synthetic-context-secret'), false);
+            assert.equal(cause.notRun, true);
+            return true;
+          },
+        );
+        assert.equal(f.counts().lists, 3);
+      });
+      await t.test('a change during catalog loading refuses the context', async () => {
+        const f = await fixture();
+        f.beforeList(f.replace);
+        await assert.rejects(f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args), refused);
+        assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+      });
+      await t.test('a change during credential loading makes no metadata request', async () => {
+        const f = await fixture();
+        f.beforeToken(f.replace);
+        await assert.rejects(f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args), refused);
+        assert.deepEqual(f.counts(), { lists: 0, calls: 0 });
+      });
+      await t.test('an old approval cannot dispatch through a new connection', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        await f.replace();
+        await assert.rejects(
+          f.discovered.execute(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            undefined,
+            undefined,
+            details.verifiedBinding,
+          ),
+          refused,
+        );
+        assert.equal(f.counts().calls, 0);
+      });
+      await t.test('a change during dispatch credential loading makes no tool call', async () => {
+        const f = await fixture();
+        const details = await f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args);
+        f.beforeToken(f.replace);
+        await assert.rejects(
+          f.discovered.execute(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            undefined,
+            undefined,
+            details.verifiedBinding,
+          ),
+          refused,
+        );
+        assert.equal(f.counts().calls, 0);
+      });
+      await t.test('a new OAuth connection does not join or accept an old refresh', async () => {
+        const connectionId = randomUUID();
+        const path = {
+          id: randomUUID(),
+          kind: 'mcp',
+          endpoint: 'https://old-context.example.test/mcp',
+          auth: 'oauth',
+        };
+        const sibling = { ...path, id: randomUUID() };
+        const replacement = { ...path, endpoint: 'https://new-context.example.test/mcp' };
+        const state = (name: string) => ({
+          redirectUri: 'http://localhost/callback',
+          tokens: {
+            access_token: `synthetic-${name}-access`,
+            refresh_token: `synthetic-${name}-refresh`,
+            token_type: 'Bearer',
+          },
+          expiresAt: 1,
+        });
+        let entered!: () => void;
+        let release!: () => void;
+        const refreshing = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const waiting = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const refreshes: string[] = [];
+        const metadata: string[] = [];
+        const unused = async () => assert.fail('No action is expected.');
+        const discovered = await createDiscoveredConnections(pool, {
+          ownerId: owner,
+          baseUrl: 'http://localhost:4310',
+          grantVault,
+          transport: {
+            validateEndpoint: async (value) => value,
+            http: unused,
+            callTool: unused,
+            listTools: async (endpoint, headers) => {
+              assert.equal(endpoint, replacement.endpoint);
+              assert.equal(headers.Authorization, 'Bearer synthetic-refreshed-new');
+              metadata.push(endpoint);
+              return { tools: [{ name: 'read_rows', inputSchema: {} }] };
+            },
+          },
+          oauth: {
+            begin: unused,
+            finish: unused,
+            refresh: async (endpoint, saved) => {
+              const old = endpoint === path.endpoint;
+              assert.equal(
+                saved.tokens!.refresh_token,
+                state(old ? 'old' : 'new').tokens.refresh_token,
+              );
+              refreshes.push(endpoint);
+              if (old) {
+                entered();
+                await waiting;
+              }
+              return {
+                ...saved,
+                tokens: {
+                  ...saved.tokens!,
+                  access_token: `synthetic-refreshed-${old ? 'old' : 'new'}`,
+                },
+                expiresAt: Date.now() + 3_600_000,
+              };
+            },
+          },
+        });
+        await pool.query(
+          'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+          [
+            connectionId,
+            owner,
+            'oauth-context',
+            'Synthetic MCP',
+            'Synthetic account',
+            JSON.stringify([path, sibling]),
+          ],
+        );
+        await grantVault.put(connectionId, JSON.stringify(state('old')));
+        const args = { connectionId, pathId: path.id, tool: 'read_rows', input: {} };
+        const old = discovered.approvalDetails('CONNECTED_MCP_CALL', args);
+        const rejected = assert.rejects(old, refused);
+        try {
+          await refreshing;
+          const shared = discovered.approvalDetails('CONNECTED_MCP_CALL', {
+            ...args,
+            pathId: sibling.id,
+          });
+          const sharedRejected = assert.rejects(shared, refused);
+          await delay(10);
+          await transaction(async (client) => {
+            await client.query(
+              'UPDATE discovered_connections SET account_id=gen_random_uuid(),paths=$2 WHERE id=$1',
+              [
+                connectionId,
+                JSON.stringify([replacement, { ...sibling, endpoint: replacement.endpoint }]),
+              ],
+            );
+            await grantVault.put(connectionId, JSON.stringify(state('new')), client);
+          }, pool);
+          const current = discovered.approvalDetails('CONNECTED_MCP_CALL', args);
+          assert.equal(
+            await Promise.race([current.then(() => true), delay(1000).then(() => false)]),
+            true,
+          );
+          release();
+          await Promise.all([rejected, sharedRejected]);
+          assert.equal((await current).tool!.name, 'read_rows');
+          assert.deepEqual(refreshes, [path.endpoint, replacement.endpoint]);
+          assert.deepEqual(metadata, [replacement.endpoint]);
+          assert.equal(
+            JSON.parse((await grantVault.read(connectionId)).value).tokens.access_token,
+            'synthetic-refreshed-new',
+          );
+          assert.equal(
+            (
+              await pool.query(
+                'SELECT reconnect_required FROM discovered_connections WHERE id=$1',
+                [connectionId],
+              )
+            ).rows[0].reconnect_required,
+            false,
+          );
+        } finally {
+          release();
+          await rejected;
+        }
+      });
+      await t.test('Stop refuses a cold or shared lookup after a late response', async () => {
+        for (const shared of [false, true]) {
+          const f = await fixture();
+          let entered!: () => void;
+          let release!: () => void;
+          const started = new Promise<void>((resolve) => {
+            entered = resolve;
+          });
+          const waiting = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          f.beforeList(async () => {
+            entered();
+            await waiting;
+          });
+          const controller = new AbortController();
+          const first = f.discovered.approvalDetails(
+            'CONNECTED_MCP_CALL',
+            f.args,
+            shared ? undefined : controller.signal,
+          );
+          await started;
+          const stopped = shared
+            ? f.discovered.approvalDetails('CONNECTED_MCP_CALL', f.args, controller.signal)
+            : first;
+          const rejected = assert.rejects(stopped, /synthetic_stop/);
+          controller.abort(new Error('synthetic_stop'));
+          release();
+          await rejected;
+          if (shared) assert.equal((await first).tool!.name, 'read_rows');
+          assert.deepEqual(f.counts(), { lists: 1, calls: 0 });
+        }
+      });
+    } finally {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
   'MCP catalog refresh keeps known tools available and drops disconnected accounts',
   { skip: !process.env.TEST_DATABASE_URL },
   async (t) => {
@@ -11303,6 +11891,50 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
       (error: unknown) => error === requestError,
     );
   }
+  const lookup = t.mock.method(client.getClient().toolRouter.session, 'executeMeta', async () => ({
+    error: null,
+    data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] },
+  }));
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  assert.equal(await session.offers!('GMAIL_SEND_EMAIL'), true);
+  lookup.mock.mockImplementation(
+    async () =>
+      ({
+        error: null,
+        data: { data: { success: true, tool_schemas: {}, not_found: ['GMAIL_GET_MESSAGE'] } },
+      }) as never,
+  );
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  lookup.mock.mockImplementation(async () => ({ error: 'unexpected', data: {} }) as never);
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), true);
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(404, { error: 'not_found' }, undefined, new Headers());
+  });
+  assert.equal(await session.offers!('GMAIL_GET_MESSAGE'), false);
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(404, undefined, '<html>missing</html>', new Headers());
+  });
+  await assert.rejects(session.offers!('GMAIL_GET_MESSAGE'));
+  lookup.mock.mockImplementation(async () => {
+    throw APIError.generate(503, { error: 'unavailable' }, undefined, new Headers());
+  });
+  await assert.rejects(session.offers!('GMAIL_GET_MESSAGE'));
+  requestError = APIError.generate(
+    404,
+    { error: 'not_found' },
+    undefined,
+    new Headers({ 'content-type': 'application/json' }),
+  );
+  await assert.rejects(
+    session.execute('GMAIL_GET_MESSAGE', {}, 'fixture-account'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as Error & { status?: number }).status, 404);
+      assert.ok(error.message.includes('GMAIL_GET_MESSAGE'));
+      assert.match(error.message, /HTTP 404.*not_found/);
+      return true;
+    },
+  );
 });
 
 test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
@@ -12471,7 +13103,7 @@ test(
         },
       });
       const request = { task: 'review' as const, instructions: 'Synthetic', input: {} };
-      await assert.rejects(curator.curate(request), /Synthetic usage write failure/);
+      assert.deepEqual(await curator.curate(request), {});
       const failedAt = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 20));
       await assert.rejects(curator.curate(request), /Synthetic usage write failure/);
@@ -13778,6 +14410,51 @@ test(
     const prepared = await f.service.prepare(owner, 'GITHUB_LIST_REPOSITORIES', {
       connectionId: connected.connectionId,
     });
+    for (const phase of ['session startup', 'before dispatch', 'after dispatch'])
+      await t.test(`approved action Stop during ${phase} keeps its dispatch outcome`, async () => {
+        const controller = new AbortController();
+        const stop = new Error('Synthetic boundary stop.');
+        const createSession = f.provider.createSession;
+        const execute = f.session.execute;
+        const before = f.executed.length;
+        f.provider.createSession = async (...args) => {
+          const session = await createSession(...args);
+          if (phase === 'session startup') controller.abort(stop);
+          return session;
+        };
+        f.session.execute = async (...args) => {
+          const result = await execute(...args);
+          if (phase === 'after dispatch') {
+            controller.abort(stop);
+            controller.signal.throwIfAborted();
+          }
+          return result;
+        };
+        try {
+          await assert.rejects(
+            f.service.executeApproved(
+              owner,
+              'GITHUB_LIST_REPOSITORIES',
+              prepared,
+              undefined,
+              controller.signal,
+              undefined,
+              async () => {
+                if (phase === 'before dispatch') controller.abort(stop);
+              },
+            ),
+            (error: Error & { notRun?: boolean }) => {
+              assert.match(error.message, /Synthetic boundary stop/);
+              assert.equal(error.notRun === true, phase !== 'after dispatch');
+              return true;
+            },
+          );
+          assert.equal(f.executed.length, before + (phase === 'after dispatch' ? 1 : 0));
+        } finally {
+          f.provider.createSession = createSession;
+          f.session.execute = execute;
+        }
+      });
     const execute = f.session.execute;
     for (const status of [400, 429, 503]) {
       f.session.execute = async () => {
@@ -13799,6 +14476,7 @@ test(
     ]);
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
     await f.pool.query('UPDATE app_connections SET account_active=true WHERE id=$1', [
       connected.connectionId,
@@ -13813,7 +14491,16 @@ test(
     };
     await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
       statusCode: 404,
+      notRun: true,
     });
+    assert.equal(f.executed.length, executions);
+    await f.pool.query('DELETE FROM app_connections WHERE id=$1', [connected.connectionId]);
+    const sessions = f.sessions.length;
+    await assert.rejects(f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared), {
+      statusCode: 404,
+      notRun: true,
+    });
+    assert.equal(f.sessions.length, sessions);
     assert.equal(f.executed.length, executions);
   },
 );

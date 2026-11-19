@@ -44,6 +44,31 @@ const pageSchema = z
       .optional(),
     dropTarget: controls.optional(),
     dialog: z.string().max(8192).optional(),
+    currentSelections: z
+      .object({
+        binding: z
+          .string()
+          .regex(/^[0-9a-f]{64}$/)
+          .optional(),
+        values: z
+          .array(
+            z
+              .object({
+                role: z.string().max(100),
+                name: z.string().max(300),
+                value: z.string().max(300).optional(),
+                checked: z.enum(['true', 'false', 'mixed']).optional(),
+                selected: z.boolean().optional(),
+                selectedCount: z.number().int().min(0).max(256).optional(),
+                group: z.string().max(300).optional(),
+              })
+              .strict(),
+          )
+          .max(20),
+        incomplete: z.string().max(1000).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -496,6 +521,7 @@ export function createBridgeComputer(options: {
               ...(input.expectOrigin ? { expectOrigin: input.expectOrigin } : {}),
               ...(input.expectUrl ? { expectUrl: input.expectUrl } : {}),
               ...(input.expectTarget ? { expectTarget: input.expectTarget } : {}),
+              ...(input.expectSelections ? { expectSelections: input.expectSelections } : {}),
             },
           },
           signal,
@@ -528,13 +554,16 @@ export function createBridgeComputer(options: {
       if (bytes.length !== result.size) throw new Error('The browser file is unavailable.');
       return { bytes, name: result.name, mimeType: result.mimeType };
     },
-    currentPage: async (id, step) =>
+    currentPage: async (id, step, signal) =>
       pageSchema.parse(
-        await call({
-          method: 'currentPage',
-          threadId: threadIdentity(id),
-          ...(step ? { input: step } : {}),
-        }),
+        await call(
+          {
+            method: 'currentPage',
+            threadId: threadIdentity(id),
+            ...(step ? { input: step } : {}),
+          },
+          signal,
+        ),
       ),
     signInMethods: async (id, origin, methods, signal) =>
       z
@@ -559,11 +588,14 @@ export function createBridgeComputer(options: {
     selectSignInMethod: async (id, input, signal) => {
       await call({ method: 'selectSignInMethod', threadId: threadIdentity(id), input }, signal);
     },
-    fillCard: async (input) => {
-      await call({
-        method: 'fillCard',
-        input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
-      });
+    fillCard: async (input, signal) => {
+      await call(
+        {
+          method: 'fillCard',
+          input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
+        },
+        signal,
+      );
     },
     cardDestinations: async (id, fields) =>
       z
@@ -587,20 +619,23 @@ export function createBridgeComputer(options: {
         throw new Error('The checkout page could not be captured.');
       return new Uint8Array(Buffer.from(value, 'base64'));
     },
-    injectCredentials: async (input) => {
+    injectCredentials: async (input, signal) => {
       return (
         z
           .object({ status: z.literal('submitted') })
           .strict()
           .nullable()
           .parse(
-            await call({
-              method: 'injectCredentials',
-              input: browserCredentialInput.parse({
-                ...input,
-                threadId: threadIdentity(input.threadId),
-              }),
-            }),
+            await call(
+              {
+                method: 'injectCredentials',
+                input: browserCredentialInput.parse({
+                  ...input,
+                  threadId: threadIdentity(input.threadId),
+                }),
+              },
+              signal,
+            ),
           ) ?? undefined
       );
     },

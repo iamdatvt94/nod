@@ -17,6 +17,7 @@ import {
   screen,
   session,
   shell,
+  systemPreferences,
   Tray,
   utilityProcess,
 } from 'electron';
@@ -42,6 +43,8 @@ import {
   watchAssistantMessages,
 } from './notifications.mjs';
 import { createAppPreferencesStore } from './app-preferences.mjs';
+import { createComputerHelper } from './computer-helper.mjs';
+import { createComputerOverlay } from './computer-overlay.mjs';
 import { createChatReadCursorStore } from './chat-read-cursors.mjs';
 import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
@@ -118,6 +121,46 @@ app.setPath(
   developmentDataRoot || join(app.getPath('appData'), testInstall ? 'nod Setup Test' : 'nod'),
 );
 const profileRoot = join(app.getPath('userData'), 'profiles', 'local');
+const agentDesktop = app.isPackaged
+  ? process.platform === 'darwin'
+    ? join(process.resourcesPath, '..', 'Helpers')
+    : join(process.resourcesPath, 'agent-desktop')
+  : join(desktopRoot, 'node_modules', 'agent-desktop', 'bin');
+const executable = process.platform === 'win32' ? '.exe' : '';
+const computerOverlay = createComputerOverlay({
+  onStop: () => {
+    void computerHelper.cancel();
+    void engineRequest('/api/thread/stop', { method: 'POST' }).catch(() => {});
+  },
+  focusSelf: () => showEngine(),
+});
+const computerHelper = createComputerHelper({
+  presence: computerOverlay,
+  binary: join(
+    agentDesktop,
+    app.isPackaged
+      ? `agent-desktop${executable}`
+      : `agent-desktop-${process.platform}-${process.arch}${executable}`,
+  ),
+  helper:
+    process.platform === 'darwin'
+      ? join(
+          agentDesktop,
+          app.isPackaged
+            ? 'agent-desktop-macos-helper'
+            : `agent-desktop-macos-helper-darwin-${process.arch}`,
+        )
+      : undefined,
+  home: join(profileRoot, 'computer-use'),
+  sandboxed: process.platform === 'linux' && Boolean(process.env.FLATPAK_ID),
+  requestPermission: async (which) => {
+    if (which === 'accessibility') systemPreferences.isTrustedAccessibilityClient(true);
+    else
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      );
+  },
+});
 const freshLocalProfile = await stat(profileRoot).then(
   () => false,
   (error) => error.code === 'ENOENT',
@@ -177,8 +220,10 @@ let checkingUpdates;
 let updateRequestedManually = false;
 let updateRestartConfirmed = false;
 let updatePhase = 'idle';
+let updateStep = 'checking';
 let updateProgress;
-let updateFailed = false;
+let updateFailure;
+let nextUpdateFailureId = 0;
 let installUpdateOnQuit = true;
 let dismissedUpdateVersion;
 let pendingPreload;
@@ -1299,6 +1344,15 @@ function openOnePassword(owner) {
   owner.once('exit', () => helper.kill());
 }
 
+async function answerComputer(child, { id, request }) {
+  if (typeof id !== 'string' || !request || typeof request !== 'object') return;
+  const answer = await computerHelper.request(request).then(
+    (result) => ({ result }),
+    (error) => ({ error: error.message }),
+  );
+  if (engine === child) child.postMessage({ type: 'nod-computer-result', id, ...answer });
+}
+
 async function moveToTrash(child, { id, path }) {
   if (typeof id !== 'string' || typeof path !== 'string' || !isAbsolute(path)) return;
   const error = await shell.trashItem(path).then(
@@ -1760,6 +1814,7 @@ function stayAwake(working) {
 }
 
 async function stopEngine() {
+  void computerHelper.cancel().catch(() => {});
   stayAwake(false);
   enginePreferencesReady = false;
   engineRuntimeReady = false;
@@ -1969,6 +2024,17 @@ async function finishEnginePreparation(pending = false) {
   return status;
 }
 
+function reportUpdateStatus(phase, progress) {
+  if (['checking', 'preparing', 'downloading'].includes(phase)) updateStep = phase;
+  const percent = Number.isFinite(progress)
+    ? Math.min(100, Math.max(0, Math.floor(progress * 100)))
+    : undefined;
+  if (phase === updatePhase && percent === updateProgress) return;
+  updatePhase = phase;
+  updateProgress = percent;
+  refreshUpdateMenu();
+}
+
 function publicUpdateStatus() {
   return {
     phase: updatePhase,
@@ -1976,7 +2042,115 @@ function publicUpdateStatus() {
     ...(updateProgress === undefined ? {} : { progress: updateProgress }),
     ...(updates?.ready ? { readyVersion: updates.ready.version } : {}),
     ...(dismissedUpdateVersion ? { dismissedVersion: dismissedUpdateVersion } : {}),
+    ...(updateFailure ? { failure: { ...updateFailure } } : {}),
   };
+}
+
+function updateFailureDetails(error) {
+  const parts = [];
+  const seen = new Set();
+  for (
+    let current = error;
+    current && parts.length < 3 && !seen.has(current);
+    current = current.cause
+  ) {
+    seen.add(current);
+    let text = String(current.message || 'The update operation failed.').slice(0, 8000);
+    const start = text.indexOf('{');
+    let details;
+    if (start >= 0) {
+      try {
+        details = JSON.parse(text.slice(start));
+      } catch {}
+      text = text.slice(0, start);
+      for (const key of ['reason', 'message'])
+        if (typeof details?.[key] === 'string') text += ` ${details[key]}`;
+    }
+    const value = bounded(current.code ?? details?.code);
+    const code =
+      /^-?\d{1,5}$/.test(value) ||
+      [
+        'EACCES',
+        'EPERM',
+        'ENOENT',
+        'ENOSPC',
+        'EBUSY',
+        'EEXIST',
+        'EIO',
+        'EROFS',
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ECONNABORTED',
+        'ENOTFOUND',
+        'EAI_AGAIN',
+        'ETIMEDOUT',
+        'ABORT_ERR',
+        'ERR_ABORTED',
+        'ERR_INVALID_URL',
+        'ERR_SOCKET_CLOSED',
+        'ERR_STREAM_PREMATURE_CLOSE',
+        'UND_ERR_CONNECT_TIMEOUT',
+        'UND_ERR_HEADERS_TIMEOUT',
+        'UND_ERR_BODY_TIMEOUT',
+        'UND_ERR_SOCKET',
+        'NOD_RUNTIME_STOP_FAILED',
+        'NOD_WSL_REQUIRED',
+        'RUNTIME_ARCHIVE_REQUIRED',
+      ].includes(value)
+        ? `${value}: `
+        : '';
+    const status = [current.status, current.statusCode, details?.status, details?.statusCode].find(
+      (value) => Number.isInteger(value) && value >= 100 && value <= 599,
+    );
+    const message = bounded(text, 8000)
+      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, '<redacted>')
+      .replace(/\b(?:authorization|cookie|set-cookie)\s*:[^\r\n]+/gi, '<redacted>')
+      .replace(
+        /\b(?:[a-z_-]*(?:password|secret|token|credential|key)|passwd|pwd)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+        '<redacted>',
+      )
+      .replace(/https?:\/\/[^\s<>"']+/gi, '<url>')
+      .replace(/'[^'\r\n]*[\\/][^'\r\n]*'|"[^"\r\n]*[\\/][^"\r\n]*"/g, '<path>')
+      .replace(/(?:[A-Z]:[\\/]|\\\\)[^\r\n<>"']+/gi, '<path>')
+      .replace(/(?<![\w<>])\/[^/\s:'"<>][^\r\n:'"<>]*/g, '<path>')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '<address>')
+      .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/g, '<host>')
+      .replace(
+        /\[?(?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}(?:%[a-z0-9_.-]+)?\]?(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/gi,
+        '<host>',
+      )
+      .replace(
+        /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}\b(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/gi,
+        '<host>',
+      )
+      .replace(/\blocalhost(?::\d{1,5})?/gi, '<host>')
+      .replace(/(\b(?:ENOTFOUND|EAI_AGAIN)\s+)[^\s,;]+/g, '$1<host>')
+      .replace(/[A-Za-z0-9+/_=-]{24,}/g, '<redacted>');
+    parts.push(`${code}${message}${status ? ` (HTTP ${status})` : ''}`);
+  }
+  return parts.join(' ').slice(0, 2000);
+}
+
+async function openUpdateDownload() {
+  while (!installingUpdate) {
+    try {
+      await shell.openExternal('https://nod.n8n.io/docs/get-started/install-desktop/');
+      return;
+    } catch (error) {
+      const detail = updateFailureDetails(error);
+      await updateEvent('download-page-failed', { message: detail });
+      const { response } = await dialog.showMessageBox({
+        type: 'info',
+        message: 'Nod could not open the download page.',
+        detail: `${detail}\n\nhttps://nod.n8n.io/docs/get-started/install-desktop/`,
+        buttons: ['Try again', quitting ? 'Quit Nod' : 'Not now'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (response !== 0) return;
+    }
+  }
 }
 
 function publishUpdateStatus() {
@@ -1994,7 +2168,7 @@ function refreshUpdateMenu() {
           checking: 'Checking for updates…',
           preparing: 'Preparing update…',
           downloading: 'Downloading update…',
-        }[updatePhase] || (updateFailed ? 'Update Failed. Try Again…' : 'Check for Updates…');
+        }[updatePhase] || (updateFailure ? 'Update Failed. Try Again…' : 'Check for Updates…');
   const item = Menu.getApplicationMenu?.()?.getMenuItemById('desktop-update');
   if (item) {
     item.label = label;
@@ -2045,6 +2219,7 @@ async function checkForUpdates(manual = true, restartReady = false, confirmed = 
   }
   updateRequestedManually = manual;
   updateRestartConfirmed = confirmed;
+  updateStep = 'checking';
   const release = () => {
     if (checkingUpdates === checking) checkingUpdates = undefined;
     refreshUpdateMenu();
@@ -2065,7 +2240,7 @@ async function checkForUpdates(manual = true, restartReady = false, confirmed = 
         const candidate = restartReady ? updates.ready : await updates.check();
         if (!restartReady)
           void updateEvent('check-finished', { ready: candidate?.version ?? 'none' });
-        updateFailed = false;
+        updateFailure = undefined;
         if (quitting) return;
         if (!candidate) {
           if (updateRequestedManually)
@@ -2095,23 +2270,31 @@ async function checkForUpdates(manual = true, restartReady = false, confirmed = 
         return;
       } catch (error) {
         if (quitting) return;
-        if (!restarting) updateFailed = true;
+        const phase = restarting ? 'restart' : updateStep;
+        const message = updateFailureDetails(error);
+        if (
+          updateRequestedManually ||
+          updateFailure?.phase !== phase ||
+          updateFailure?.message !== message
+        )
+          updateFailure = { id: ++nextUpdateFailureId, phase, message };
+        publishUpdateStatus();
         await updateEvent('error', {
-          phase: restarting ? 'restart' : 'check',
-          code: error.code,
-          message: error.message,
+          phase,
+          message,
         });
         if (quitting) return;
         if (!updateRequestedManually && !restarting) throw error;
         const { response } = await dialog.showMessageBox({
           type: 'info',
-          message: restarting ? 'Couldn’t restart Nod' : 'Couldn’t check for updates',
-          detail: 'You can keep using Nod and try again later.',
-          buttons: [restarting ? 'Retry restart' : 'Try again', 'Not now'],
-          defaultId: 1,
-          cancelId: 1,
+          message: restarting ? 'Couldn’t restart Nod' : 'Couldn’t update Nod',
+          detail: `${message}\n\nYou can keep using Nod.`,
+          buttons: [restarting ? 'Retry restart' : 'Try again', 'Download Nod', 'Not now'],
+          defaultId: 2,
+          cancelId: 2,
           noLink: true,
         });
+        if (response === 1 && !quitting) await openUpdateDownload();
         if (response !== 0 || quitting) return;
       }
     }
@@ -2180,7 +2363,7 @@ async function restartForUpdate() {
   if (engineWindow && !engineWindow.isDestroyed()) engineWindow.show();
   else await showSettings('general', true);
   await rememberState(window);
-  await quit(installUpdate);
+  await quit(installUpdate, undefined, true);
 }
 
 async function rememberState(window) {
@@ -2304,7 +2487,7 @@ async function installUpdate({ relaunch = true } = {}) {
     const failed = (error) => {
       cleanup();
       installingUpdate = false;
-      void updateEvent('error', { phase: 'install', code: error?.code, message: error?.message });
+      void updateEvent('error', { phase: 'install', message: updateFailureDetails(error) });
       reject(error);
     };
     const accepted = () => {
@@ -2323,24 +2506,12 @@ async function installUpdate({ relaunch = true } = {}) {
 }
 
 async function quitApp() {
-  await quit(async () => {
-    if (installUpdateOnQuit && process.platform === 'win32' && updates?.ready) {
-      try {
-        await installUpdate({ relaunch: false });
-        return;
-      } catch (error) {
-        await updateEvent('error', {
-          phase: 'install-on-quit',
-          code: error.code,
-          message: error.message,
-        });
-      }
-    }
-    app.exit();
-  });
+  if (installUpdateOnQuit && process.platform === 'win32' && updates?.ready)
+    await quit(() => installUpdate({ relaunch: false }), undefined, true);
+  else await quit(() => app.exit());
 }
 
-async function quit(complete, failure = 'Nod could not finish shutting down.') {
+async function quit(complete, failure = 'Nod could not finish shutting down.', update = false) {
   quitting = true;
   stayAwake(false);
   await persistCurrentZoomFactor().catch(
@@ -2356,7 +2527,7 @@ async function quit(complete, failure = 'Nod could not finish shutting down.') {
   for (const notification of displayedNotifications) notification.close();
   await stoppingUpdates;
   await chatReadCursors.flush().catch(() => {});
-  await finishQuit(complete, failure);
+  await finishQuit(complete, failure, update);
 }
 
 async function removeAllData() {
@@ -2387,24 +2558,34 @@ async function removeAllData() {
   }, 'Nod could not remove all its data.');
 }
 
-async function finishQuit(complete, failure) {
+async function finishQuit(complete, failure, update = false) {
   while (true) {
+    let installing = false;
     try {
       await disposeArtifactFiles?.();
       await lifecycle.close();
+      installing = update;
       await complete();
       return;
     } catch (error) {
-      await writeDiagnostic(error.message).catch(() => {});
+      const detail = updateFailureDetails(error);
+      await writeDiagnostic(detail).catch(() => {});
       const { response } = await dialog.showMessageBox({
         type: 'warning',
-        message: failure,
-        detail: 'Try again to finish quitting.',
-        buttons: ['Try again', 'Quit anyway'],
-        defaultId: 0,
-        cancelId: 0,
+        message: installing ? 'Nod could not install the update.' : failure,
+        detail: `${detail}\n\n${installing ? 'Nod has stopped. Try the installation again or download Nod.' : 'Try again to finish quitting.'}`,
+        buttons: installing
+          ? ['Retry installation', 'Download Nod', 'Quit without updating']
+          : ['Try again', 'Quit anyway'],
+        defaultId: installing ? 2 : 0,
+        cancelId: installing ? 2 : 0,
         noLink: true,
       });
+      if (installing && response === 1) await openUpdateDownload();
+      if (installing && response !== 0) {
+        app.exit();
+        return;
+      }
       if (response === 1) {
         app.exit();
         return;
@@ -2505,6 +2686,7 @@ async function startEngine({ runtime, signal, pending = false }) {
     }
     if (engine === child && message?.type === 'nod-1password-open') openOnePassword(child);
     if (engine === child && message?.type === 'nod-trash') void moveToTrash(child, message);
+    if (engine === child && message?.type === 'nod-computer') void answerComputer(child, message);
     if (
       engine === child &&
       !closingEngine &&
@@ -2841,15 +3023,7 @@ else {
             else await preloadUpdateImages(assets, signal);
           },
           restart: restartForUpdate,
-          onStatus: (phase, progress) => {
-            const percent = Number.isFinite(progress)
-              ? Math.min(100, Math.max(0, Math.floor(progress * 100)))
-              : undefined;
-            if (phase === updatePhase && percent === updateProgress) return;
-            updatePhase = phase;
-            updateProgress = percent;
-            refreshUpdateMenu();
-          },
+          onStatus: reportUpdateStatus,
         });
         if (!windows) {
           for (const name of [
@@ -2867,12 +3041,7 @@ else {
             'error',
             (error) =>
               void updateEvent('native-error', {
-                code: error?.code,
-                domain: error?.domain,
-                message: String(error?.message ?? '')
-                  .split('{')[0]
-                  .replace(/[A-Za-z0-9+/=_-]{24,}/g, '<omitted>')
-                  .slice(0, 300),
+                message: updateFailureDetails(error),
               }),
           );
         }
@@ -2966,11 +3135,27 @@ else {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         return publicUpdateStatus();
       });
+      ipcMain.handle('nod:updates:download', (event) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
+        return openUpdateDownload();
+      });
       ipcMain.handle('nod:updates:dismiss', (event, version) => {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
+        if (typeof version === 'number' && updateFailure?.id === version) {
+          updateFailure = { ...updateFailure, dismissed: true };
+          publishUpdateStatus();
+          return;
+        }
         if (typeof version !== 'string' || updates?.ready?.version !== version) return;
         dismissedUpdateVersion = version;
         publishUpdateStatus();
+      });
+      ipcMain.handle('nod:updates:retry', async (event, id) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
+        if (!updateFailure || updateFailure.id !== id || checkingUpdates || quitting)
+          throw new Error('The update failure has changed. Check the update notice.');
+        const restart = updateFailure.phase === 'restart';
+        await checkForUpdates(true, restart, restart);
       });
       ipcMain.handle('nod:updates:restart', async (event) => {
         if (!isEngine(event)) throw new Error('This action is unavailable.');

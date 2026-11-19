@@ -103,6 +103,7 @@ async function run(spec: AttemptSpec): Promise<AttemptResult> {
       ...(spec.backgroundModel ? { backgroundModel: spec.backgroundModel } : {}),
       observations: world.observations,
       proactiveBaseline: world.proactiveBaseline,
+      ...(world.desktop ? { desktop: world.desktop } : {}),
       integrations:
         world.apps?.provider ??
         (await import('./world/apps.ts')).createApps(

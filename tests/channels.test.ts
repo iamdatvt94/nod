@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
+import { markdownToPlainText } from 'chat';
 import { channelReply, createChannels } from '../src/server/channels.ts';
 import { createAgentReactionService } from '../src/server/agent-reactions.ts';
 import { createChatVerification } from '../src/server/chat-verification.ts';
@@ -665,6 +666,112 @@ const fixtureEnv = {
   WHATSAPP_POLICY_CONFIRMED: 'true',
 };
 
+function describeChannelSchedule(
+  transport: MessagingTransport,
+  channel: string,
+  title: string,
+  prompt: string,
+) {
+  const definition = {
+    title,
+    prompt,
+    kind: 'recurring',
+    cron: '0 15 * * *',
+    timeZone: 'UTC',
+    enabled: true,
+  };
+  return createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    canDeliverLiteral: (channelId, text, literal) =>
+      transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false,
+    review: async (_instructions, value) =>
+      Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Create this schedule?', action: 'Create schedule' },
+  }).describe({
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel,
+    action: 'NOD_schedule_create',
+    args: { ...definition },
+    details: { scheduleDefinition: definition },
+  });
+}
+
+test('channel transports check literal instructions against their actual formatting and split rules', async (t) => {
+  const sdk = createChatSdkTransport({} as pg.Pool, fixtureEnv);
+  const linked = createWhatsAppLinkedTransport({
+    mode: 'bot',
+    store: {
+      open: async () => {
+        throw new Error('This check must not open a linked account.');
+      },
+    },
+  });
+  const combined = combineMessagingTransports(sdk, linked);
+  for (const [literal, telegram, whatsapp] of [
+    [
+      'Review boîte@example.test.\n    Never send email.\nKeep [source](https://records.example.test/item) and `data`.',
+      true,
+      true,
+    ],
+    [
+      `${'a'.repeat(3600)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      true,
+    ],
+    [
+      `${'a'.repeat(4200)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      false,
+    ],
+    ['Keep ``` as literal text. Never send email.', true, false],
+    ['Keep {{emoji:smile}} as literal text.', false, false],
+  ] as const) {
+    const fence = literal.includes('```') ? '````' : '```';
+    const text = `Instruction:\n\n${fence}\n${literal}\n${fence}\n\nCreate this schedule?`;
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'unknown', text, literal }), false);
+  }
+  const literal = 'Keep *these literal markers* unchanged. Never send email.';
+  for (const [title, telegram, whatsapp] of [
+    ['Synthetic review', true, true],
+    ['{{emoji:smile}}', false, false],
+    ['```', true, false],
+  ] as const) {
+    await t.test(`checked title ${JSON.stringify(title)} preserves its channel facts`, async () => {
+      const { question: text } = await describeChannelSchedule(sdk, 'web', title, literal);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+      for (const transport of [sdk, combined]) {
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'telegram', text, literal }),
+          telegram,
+        );
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }),
+          whatsapp,
+        );
+      }
+    });
+  }
+  const block = `\`\`\`\n${literal}\n\`\`\``;
+  for (const text of [
+    `${block}\n\n> \`\`\`\n> Extra instruction\n> \`\`\``,
+    `${block}\n\n- Nested instruction:\n\n  \`\`\`\n  Extra instruction\n  \`\`\``,
+    `> \`\`\`\n> ${literal}\n> \`\`\``,
+  ]) {
+    await t.test('the sole literal block must be at the root with no nested extra block', () => {
+      for (const channelId of ['telegram', 'whatsapp'])
+        assert.equal(sdk.canDeliverLiteral!({ channelId, text, literal }), false);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), false);
+    });
+  }
+});
+
 test(
   'WhatsApp links privately, admits only its owner, fences echoes across restart, and reconnects without repeating sends',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
@@ -1043,6 +1150,34 @@ test(
               (sent[0].quoted as { message: { conversation: string } }).message.conversation,
               'Fixture task question',
             );
+            const schedulePrompt =
+              'Review boîte@example.test.\n    Never send email or change a source.';
+            const { question: scheduleQuestion } = await describeChannelSchedule(
+              transport,
+              'whatsapp',
+              'Synthetic daily review',
+              schedulePrompt,
+            );
+            const beforeSchedule = sent.length;
+            await transport.post({
+              channelId: 'whatsapp',
+              accountId,
+              threadId: jid,
+              text: scheduleQuestion,
+              replyToMessageId: 'task-prompt',
+              replyToText: 'Fixture task question',
+            });
+            assert.equal(sent.length, beforeSchedule + 1);
+            assert.ok(String(sent.at(-1)!.content.text).includes(schedulePrompt));
+            assert.ok(
+              String(sent.at(-1)!.content.text).includes('Schedule: Synthetic daily review'),
+            );
+            assert.equal((sent.at(-1)!.quoted as { key: { id: string } }).key.id, 'task-prompt');
+            await assert.rejects(
+              describeChannelSchedule(transport, 'whatsapp', '```', schedulePrompt),
+              /cannot show the complete schedule confirmation in this channel/,
+            );
+            assert.equal(sent.length, beforeSchedule + 1);
             for (const [file, kind] of [
               [
                 audioFile('reply.wav', 'audio/wav', Buffer.from('RIFF\0\0\0\0WAVEfmt ')),
@@ -4119,6 +4254,32 @@ test(
   },
 );
 
+test('channel presentation keeps punctuated local addresses out of delivery wording', async () => {
+  for (const text of [
+    'Read http://localhost:5678.',
+    'Read "http://127.0.0.1:5678".',
+    'Read http://[::1]:5678, next.',
+    'Read http://localhost.:5678.',
+    'Read `http://localhost:5678`.',
+  ]) {
+    let calls = 0;
+    const delivered = await channelReply(text, {
+      threadId: 'owned-thread',
+      present: async (_threadId, input) => {
+        calls++;
+        assert.equal(input.kind, 'delivery');
+        if (input.kind === 'delivery') assert.equal(input.secureAction, true);
+        assert.doesNotMatch(JSON.stringify(input), /localhost|127\.0\.0\.1|\[::1\]|5678/);
+        return 'Open Nod to read this instruction.';
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(delivered, 'Open Nod to read this instruction.');
+  }
+  const publicText = 'Read https://records.example.test:443.';
+  assert.equal(await channelReply(publicText, { threadId: 'owned-thread' }), publicText);
+});
+
 test('channel presentation isolates private links from the model and rejects unsafe generated output', async () => {
   const modelsLink = await channelReply('Use [Reconnect](/settings/models).', {
     threadId: 'owned-thread',
@@ -4196,6 +4357,7 @@ test(
       options: `-c search_path=${schema}`,
     });
     const threadId = await createFixtureTables(pool, 'local-development');
+    await pool.query('ALTER TABLE messages ADD COLUMN suggestions jsonb');
     const sent: { provider: string; body: Record<string, unknown> }[] = [];
     const handoffPresentations: unknown[] = [];
     const unavailableFiles: string[][] = [];
@@ -4478,6 +4640,13 @@ test(
       await channels.drain();
       assert.equal((await pool.query('SELECT * FROM turns')).rowCount, 2);
       assert.equal((await pool.query('SELECT * FROM channel_inbox')).rowCount, 2);
+      const literal = 'Review boîte@example.test. Never send email.';
+      const literalQuestion = `Instruction:\n\n\`\`\`\n${literal}\n\`\`\`\n\nSave this schedule?`;
+      for (const row of (await pool.query('SELECT channel FROM turns')).rows) {
+        assert.match(row.channel, /^(telegram|whatsapp):[a-f0-9]{32}$/);
+        assert.equal(channels.canDeliverLiteral(row.channel, literalQuestion, literal), true);
+      }
+      assert.equal(channels.canDeliverLiteral('unknown:identity', literalQuestion, literal), false);
       await addReply(
         'channel:telegram:987:123456:10',
         'Finish [securely](/credentials/private-token), [approve payment](/payments/private-token) or [add a card](/vault?add=card).',
@@ -4773,6 +4942,140 @@ test(
       }
       assert.ok(rejectedFormatting.includes('markdown'));
       rejectMarkdown = false;
+      await t.test(
+        'a checked schedule keeps its full text through Telegram plain fallback',
+        async () => {
+          const prompt = [
+            'Review boîte@example.test.',
+            '    Keep this indentation and `literal values`.',
+            'Read https://records.example.test/item.',
+            'Final limit: never send email or change a source.',
+          ].join('\n');
+          const definition = {
+            title: 'Synthetic daily review',
+            prompt,
+            kind: 'recurring',
+            cron: '0 15 * * *',
+            timeZone: 'UTC',
+            enabled: true,
+          };
+          const sourceId = 'channel:telegram:987:123456:10';
+          const source = (
+            await pool.query(
+              'SELECT t.id,t.channel FROM turns t JOIN channel_inbox i ON i.turn_id=t.id WHERE i.source_id=$1',
+              [sourceId],
+            )
+          ).rows[0];
+          let wordingCalls = 0;
+          const communication = createCommunication({
+            pool,
+            ownerId: 'local-development',
+            canDeliverLiteral: channels.canDeliverLiteral,
+            review: async (_instructions, value) => {
+              wordingCalls++;
+              if (Object(value).purpose === 'confirmation_review') {
+                assert.ok(Object(value).text.includes(prompt));
+                return { valid: true };
+              }
+              return { text: 'Create this schedule?', action: 'Create schedule' };
+            },
+          });
+          const proposal = {
+            turn: { threadId, turnId: source.id },
+            channel: source.channel,
+            action: 'NOD_schedule_create',
+            args: { ...definition },
+            details: { scheduleDefinition: definition },
+          };
+          const { question } = await communication.describe(proposal);
+          const expected = markdownToPlainText(question);
+          assert.ok(expected.includes(prompt));
+          assert.ok(expected.includes(`Schedule: ${definition.title}`));
+          const before = sent.length;
+          const rejectedBefore = rejectedFormatting.length;
+          const replyTarget = (
+            await pool.query(
+              "SELECT message_id,provider_message_id FROM channel_outbox WHERE source_id=$1 AND state='sent' ORDER BY updated_at,message_id LIMIT 1",
+              [sourceId],
+            )
+          ).rows[0];
+          assert.ok(replyTarget);
+          rejectMarkdown = true;
+          const messageId = await addReply(sourceId, question);
+          await pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE id=$1', [
+            messageId,
+            replyTarget.message_id,
+          ]);
+          await channels.drain();
+          rejectMarkdown = false;
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(rejectedFormatting.length, rejectedBefore + 1);
+          assert.equal(delivered[0]!.provider, 'telegram');
+          assert.equal(delivered[0]!.body.parse_mode, undefined);
+          assert.equal(delivered[0]!.body.text, expected);
+          assert.equal(
+            Object(delivered[0]!.body.reply_parameters).message_id,
+            Number(replyTarget.provider_message_id.split(':').at(-1)),
+          );
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`123456:${before + 101}`] },
+          );
+          assert.equal(wordingCalls, 2);
+          definition.title = '{{emoji:smile}}';
+          proposal.args.title = definition.title;
+          await assert.rejects(
+            communication.describe(proposal),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(wordingCalls, 2);
+          assert.equal(sent.length, before + 1);
+        },
+      );
+      await t.test(
+        'a checked schedule keeps its literal instruction on WhatsApp cloud',
+        async () => {
+          await pool.query(
+            "UPDATE channel_inbox SET received_at=now() WHERE source_id='channel:whatsapp:555000:wamid.good'",
+          );
+          const prompt = 'Review boîte@example.test.\n    Never send email or change a source.';
+          const { question } = await describeChannelSchedule(
+            transport,
+            'whatsapp',
+            'Synthetic daily review',
+            prompt,
+          );
+          const before = sent.length;
+          const messageId = await addReply('channel:whatsapp:555000:wamid.good', question);
+          await channels.drain();
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(delivered[0]!.provider, 'whatsapp');
+          const text = String(Object(delivered[0]!.body.text).body);
+          assert.ok(text.includes(prompt));
+          assert.ok(text.includes('Schedule: Synthetic daily review'));
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`wamid.fixture-out-${before + 1}`] },
+          );
+          await assert.rejects(
+            describeChannelSchedule(transport, 'whatsapp', '```', prompt),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(sent.length, before + 1);
+        },
+      );
       const family = '👩‍👩‍👧‍👦';
       const accented = 'e\u0301';
       const beforeUnicode = sent.length;

@@ -150,11 +150,7 @@ export function TaskCard({
   onReply?(): void;
 }) {
   const headingId = useId();
-  const stuck = task.status === 'failed';
-  const [expanded, setExpanded] = useState(stuck);
-  useEffect(() => {
-    if (stuck) setExpanded(true);
-  }, [stuck]);
+  const [expanded, setExpanded] = useState(false);
   const card = useRef<HTMLElement>(null);
   const inChat = Boolean(onReply);
   useEffect(() => {

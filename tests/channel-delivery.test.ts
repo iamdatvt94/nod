@@ -2768,6 +2768,13 @@ for (const provider of ['telegram', 'whatsapp'])
         await channels.drain();
         assert.deepEqual(calls.at(-1), { command: 'tasks', target: undefined, hasReply: false });
         assert.equal((await pool.query('SELECT count(*)::int AS n FROM turns')).rows[0].n, 1);
+        receive('111', 'clear-chat', 'chat-a', '/clear@fixture_bot');
+        await channels.drain();
+        assert.deepEqual(calls.at(-1), { command: 'clear', target: undefined, hasReply: false });
+        assert.equal((await turnOf('clear-chat')).turn_id, null);
+        const clears = calls.filter(({ command }) => command === 'clear').length;
+        await channels.drain();
+        assert.equal(calls.filter(({ command }) => command === 'clear').length, clears);
         const beforeRetired = calls.length;
         await pool.query('UPDATE messages SET hidden_at=now() WHERE id=$1', [anchor]);
         receive('111', 'retired-stop', 'chat-a', '/stop', 'provider-1');

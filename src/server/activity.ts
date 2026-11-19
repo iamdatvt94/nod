@@ -67,6 +67,7 @@ const toolLabels = new Map([
   ['fetch content', 'Reading a web page'],
   ['get search content', 'Reading search results'],
   ['browser', 'Using the browser'],
+  ['computer', 'Using an app'],
   ['delegate', 'Working with helpers'],
   ['create audio', 'Making audio'],
   ['share file', 'Preparing a file'],

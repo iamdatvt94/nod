@@ -78,6 +78,7 @@ flowchart LR
 <TabItem label="Mac" icon="apple">
 
 - Electron runs the app window and the Nod server. While you use 1Password, a separate helper talks to the 1Password app; it's the only Nod process allowed to load 1Password's library.
+- When you turn on [computer use](/connect/computer-use/), which is experimental, Nod runs [agent-desktop](https://github.com/vercel-labs/agent-desktop) by Vercel Labs, bundled in the app, to read app windows through macOS accessibility and act on them in the background where it can, bringing an app forward for some steps. Nod runs one command at a time, keeps its working files in Nod's private profile folder, and needs the Accessibility and, for window pictures, Screen Recording permissions you grant in System Settings.
 - Lima and Apple's Virtualization framework run a private Ubuntu virtual machine. New installations use Ubuntu 26.04 LTS, including the systemd fixes for a [first-boot login-session race](https://github.com/lima-vm/lima/issues/5570) that could otherwise stall startup for several minutes. Existing installations keep their guest and data. The VM gets half your memory, between 3 and 6 GiB, and a 24 GiB disk that grows as it's used. Its first boot installs the matching firewall packages from the runtime pack, and uses Ubuntu's package servers only if that installation fails.
 - The VM holds PostgreSQL and separate workspace and browser containers. Docker runs only inside the VM.
 - The VM keeps automatic security updates for other packages. Automatic updates cannot replace its Linux kernel, GRUB, or shim, or restart the VM. Kernel security fixes need a tested, explicit upgrade. A new runtime pack does not upgrade an existing VM's kernel.
@@ -90,6 +91,7 @@ flowchart LR
 - A private WSL 2 distribution named `nod-<profile>` holds PostgreSQL and separate workspace and browser containers. Docker runs only inside it.
 - Nod reaches PostgreSQL through WSL's localhost forwarding, on a loopback port it picks free at each launch.
 - Nod doesn't change your default WSL distribution or global WSL settings.
+- [Computer use](/connect/computer-use/), experimental here, runs the bundled agent-desktop through Windows UI Automation. It needs no permission, and can't operate apps that run as administrator.
 
 </TabItem>
 <TabItem label="Linux (preview)" icon="linux">
@@ -99,6 +101,7 @@ flowchart LR
 - Nod needs `/dev/kvm`. Without hardware virtualization it refuses to start its private computer rather than fall back to slow emulation.
 - The VM files live in `~/.nod-desktop`, as on a Mac. Saved keys use your desktop's Secret Service, such as GNOME Keyring or KWallet; Nod refuses to save keys when no secret store is available.
 - Install the next release bundle to update the app. These bundles have no update repository. Nod's own update checks are off on Linux.
+- [Computer use](/connect/computer-use/) doesn't work in the Flatpak yet: agent-desktop needs the host's process list to reach the AT-SPI accessibility bus, and the sandbox hides it ([agent-desktop issue #593](https://github.com/vercel-labs/agent-desktop/issues/593)).
 - Like the Mac and Windows apps, the Flatpak can reach your home folder and external drives, so [Local files](/connect/local-files/) and saving to Downloads work. Moving files to the Trash goes through your desktop's portal service (`xdg-desktop-portal`), and saved files go to the Downloads folder your desktop names in `~/.config/user-dirs.dirs`, or your home folder without one. A normal desktop session provides both.
 
 </TabItem>

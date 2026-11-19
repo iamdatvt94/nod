@@ -20,6 +20,7 @@ import type {
 } from '../../ports/computer.ts';
 import { BrowserActionError } from '../../ports/computer.ts';
 import { fileBytes } from '../../shared/files.ts';
+import { isEnterKey } from '../../shared/browser-keys.ts';
 import type { BrowserHandoffInput } from '../../shared/browser-handoff.ts';
 import { threadIdentity } from '../../ports/thread-identity.ts';
 import { runProcess, serviceEnvironment } from '../process.ts';
@@ -1370,34 +1371,77 @@ export function createAgentBrowserComputer(options: {
     submitSelector: string | undefined,
     operation: (devtools: Awaited<ReturnType<typeof openDevtools>>, document: string) => Promise<T>,
     submitOrigins: string[] = [],
+    signal?: AbortSignal,
   ): Promise<T> {
     if (state.injecting) throw new BrowserLockedError();
+    const assertOpen = () => {
+      signal?.throwIfAborted();
+      if (state.closed || state.closing)
+        throw new Error('The browser session has expired. Open the URL again.');
+    };
     state.injecting = true;
     try {
       return await serialize(state, async () => {
-        const devtools = await inspector(state);
+        const devtools = await inspector(state, signal);
         try {
           const document = await checkout(state, devtools);
           state.privateDocument = document;
           state.saved.sensitive = true;
           await saveState(state);
+          assertOpen();
           const result = await operation(devtools, document);
           if (submitSelector && (await devtools.document()) !== document)
             throw new BrowserActionError('browser_card_changed');
           if ((await devtools.document()) === document) {
             if (submitSelector) {
-              const field = await focusField(state, devtools, selector(submitSelector));
+              const control = selector(submitSelector);
+              assertOpen();
+              await devtools.blur();
+              const readyBy = performance.now() + 30_000;
+              for (;;) {
+                assertOpen();
+                if ((await devtools.document()) !== document)
+                  throw new BrowserActionError('browser_card_changed');
+                const { enabled } = z.object({ enabled: z.boolean() }).parse(
+                  await command(
+                    state,
+                    { action: 'isenabled', selector: control },
+                    { signal },
+                  ).catch(async (error) => {
+                    signal?.throwIfAborted();
+                    if (!(error instanceof DaemonCommandError)) throw error;
+                    const changed = await devtools.document().then(
+                      (current) => current !== document,
+                      () => false,
+                    );
+                    signal?.throwIfAborted();
+                    if (changed) throw new BrowserActionError('browser_card_changed');
+                    throw error;
+                  }),
+                );
+                if (enabled) break;
+                if (performance.now() >= readyBy)
+                  throw new BrowserActionError('browser_card_disabled');
+                await delay(100, undefined, { signal });
+              }
+              const field = await focusField(state, devtools, control);
               const origin = new URL(await currentUrl(state)).origin;
               if (
                 (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
                 (await devtools.document()) !== document
               )
                 throw new Error('The submit control is not on this page.');
-              await command(state, {
-                action: 'scrollintoview',
-                selector: selector(submitSelector),
-              });
-              await command(state, { action: 'click', selector: selector(submitSelector) });
+              assertOpen();
+              await command(
+                state,
+                {
+                  action: 'scrollintoview',
+                  selector: control,
+                },
+                { signal },
+              );
+              assertOpen();
+              await command(state, { action: 'click', selector: control }, { signal });
             }
           }
           state.privateDocument = undefined;
@@ -1412,37 +1456,52 @@ export function createAgentBrowserComputer(options: {
     }
   }
 
-  async function injectCredentials(input: CredentialInput): Promise<CredentialSubmission> {
+  async function injectCredentials(
+    input: CredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CredentialSubmission> {
+    signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(input.threadId));
     if (!state?.started) throw new Error('The browser session has expired. Reopen the login page.');
     if (browserUrl(input.origin).origin !== input.origin)
       throw new Error('An exact login origin is required.');
     const fields = credentialFields(input);
-    return privateEntry(state, input.submitSelector, async (devtools, document) => {
-      if (new URL(await currentUrl(state)).origin !== input.origin)
-        throw new Error('The page is not on the website for this login.');
-      for (const step of fields) {
-        const secret = input.kind === 'otp' ? input.code! : step.value;
-        const identifier = input.kind === 'identifier' || step.value === input.username;
-        if (!identifier) state.secrets.add(secret);
-        const field = await focusField(state, devtools, step.selector);
-        if (field.origin !== input.origin)
-          throw new Error('The login field is on a different origin.');
-        if (step.code) {
-          if (!(await devtools.code(field, step.selector, step.value)))
-            throw new Error('The code fields changed during private entry.');
-          continue;
+    return privateEntry(
+      state,
+      input.submitSelector,
+      async (devtools, document) => {
+        if (new URL(await currentUrl(state)).origin !== input.origin)
+          throw new Error('The page is not on the website for this login.');
+        for (const step of fields) {
+          signal?.throwIfAborted();
+          const secret = input.kind === 'otp' ? input.code! : step.value;
+          const identifier = input.kind === 'identifier' || step.value === input.username;
+          if (!identifier) state.secrets.add(secret);
+          const field = await focusField(state, devtools, step.selector);
+          if (field.origin !== input.origin)
+            throw new Error('The login field is on a different origin.');
+          signal?.throwIfAborted();
+          if (step.code) {
+            if (!(await devtools.code(field, step.selector, step.value)))
+              throw new Error('The code fields changed during private entry.');
+            continue;
+          }
+          if (!(await devtools.arm(field)))
+            throw new Error('The login field is no longer available.');
+          if (
+            (await devtools.document()) !== document ||
+            !(await devtools.insert(field, step.value))
+          )
+            throw new Error(
+              'The login field changed during entry. Check the result before another attempt.',
+            );
         }
-        if (!(await devtools.arm(field)))
-          throw new Error('The login field is no longer available.');
-        if ((await devtools.document()) !== document || !(await devtools.insert(field, step.value)))
-          throw new Error(
-            'The login field changed during entry. Check the result before another attempt.',
-          );
-      }
-      await saveState(state);
-      return { status: 'submitted' as const };
-    });
+        await saveState(state);
+        return { status: 'submitted' as const };
+      },
+      [],
+      signal,
+    );
   }
 
   async function privateDocumentOpen(state: BrowserState, signal?: AbortSignal) {
@@ -1572,7 +1631,8 @@ export function createAgentBrowserComputer(options: {
     });
   }
 
-  async function fillCard(input: CardEntry): Promise<void> {
+  async function fillCard(input: CardEntry, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(input.threadId));
     if (!state?.started) throw new Error('The checkout page is no longer open.');
     if (state.injecting) throw new BrowserLockedError();
@@ -1623,6 +1683,7 @@ export function createAgentBrowserComputer(options: {
       async (devtools, document) => {
         if (document !== input.document) throw new BrowserActionError('browser_card_changed');
         for (const step of steps) {
+          signal?.throwIfAborted();
           const privateValue = step.field === 'number' || step.field === 'securityCode';
           if (privateValue) for (const value of step.values) state.secrets.add(value);
           const selection = fields[step.field]!;
@@ -1633,6 +1694,7 @@ export function createAgentBrowserComputer(options: {
           );
           if (field.origin !== input.destinations[step.field])
             throw new BrowserActionError('browser_card_site');
+          signal?.throwIfAborted();
           const tag = await devtools.arm(field, privateValue);
           if (!tag) throw new BrowserActionError('browser_card_field');
           if (tag === 'SELECT') {
@@ -1646,6 +1708,7 @@ export function createAgentBrowserComputer(options: {
         }
       },
       steps.map((step) => input.destinations[step.field]!),
+      signal,
     );
   }
 
@@ -1682,7 +1745,14 @@ export function createAgentBrowserComputer(options: {
       .object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() })
       .passthrough()
       .parse(await command(state, { action: 'boundingbox', selector: `@${ref}` }));
-    return { pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 } };
+    const control = state.refs.get(ref);
+    const same = [...state.refs.values()].filter(
+      (item) => item.role === control?.role && item.name === control.name,
+    );
+    return {
+      pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+      ...(same.length === 1 ? { control } : {}),
+    };
   }
 
   async function submissionOf(
@@ -1719,7 +1789,7 @@ export function createAgentBrowserComputer(options: {
             : { focused: step.action === 'type' };
     const { controls, identity: sourceIdentity } = await controlsOf(state, target);
     const enter =
-      (step.action === 'press' && step.key === 'Enter') ||
+      (step.action === 'press' && isEnterKey(step.key)) ||
       (step.action === 'type' && /[\r\n]/.test(step.text ?? ''));
     const submits =
       step.action === 'click' || enter ? await submissionOf(state, target, enter) : undefined;
@@ -1760,6 +1830,82 @@ export function createAgentBrowserComputer(options: {
     return { target, details };
   }
 
+  async function currentSelections(
+    state: BrowserState,
+    signal?: AbortSignal,
+  ): Promise<NonNullable<BrowserPage['currentSelections']>> {
+    const captureSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(5000)])
+      : AbortSignal.timeout(5000);
+    captureSignal.throwIfAborted();
+    let abort = () => {};
+    const stopped = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(captureSignal.reason);
+      captureSignal.addEventListener('abort', abort, { once: true });
+    });
+    let active: Awaited<ReturnType<typeof inspector>> | undefined;
+    try {
+      const capture = async () => {
+        const devtools = await inspector(state, captureSignal);
+        active = devtools;
+        try {
+          captureSignal.throwIfAborted();
+          const observed = await devtools.selections();
+          captureSignal.throwIfAborted();
+          const binding = createHmac('sha256', targetKey)
+            .update('selections:')
+            .update(JSON.stringify(observed))
+            .digest('hex');
+          let incomplete: string | undefined;
+          const selected = observed.flatMap((frame) => frame.values);
+          if (selected.length > 20) incomplete = 'The page has more than 20 current selections.';
+          const values = selected
+            .slice(0, 20)
+            .map(
+              ({
+                node: _node,
+                parent: _parent,
+                nativeValue: _nativeValue,
+                valueText: _valueText,
+                ...value
+              }) => {
+                for (const key of ['role', 'name', 'value', 'group'] as const) {
+                  const original = value[key];
+                  if (original === undefined) continue;
+                  const safe = redactBrowserText(original, state.secrets);
+                  if (safe !== original) incomplete = 'A current selected value is hidden.';
+                  const limit = key === 'role' ? 100 : 300;
+                  if (safe.length > limit)
+                    incomplete = 'A current selected value exceeds the description limit.';
+                  value[key] = safe.slice(0, limit);
+                }
+                return value;
+              },
+            );
+          return { binding, values, ...(incomplete ? { incomplete } : {}) };
+        } finally {
+          devtools.close();
+          if (active === devtools) active = undefined;
+        }
+      };
+      return await Promise.race([capture(), stopped]);
+    } catch (error) {
+      signal?.throwIfAborted();
+      return {
+        values: [],
+        incomplete:
+          'The current selections could not be read: ' +
+          redactBrowserText(
+            error instanceof Error ? error.message : String(error),
+            state.secrets,
+          ).slice(0, 950),
+      };
+    } finally {
+      captureSignal.removeEventListener('abort', abort);
+      active?.close();
+    }
+  }
+
   async function onTarget(
     state: BrowserState,
     input: Omit<BrowserAction, 'action'> & { action?: BrowserAction['action'] },
@@ -1768,9 +1914,18 @@ export function createAgentBrowserComputer(options: {
     if (
       input.expectOrigin === undefined &&
       input.expectUrl === undefined &&
-      input.expectTarget === undefined
+      input.expectTarget === undefined &&
+      input.expectSelections === undefined
     )
       return;
+    if (input.expectSelections !== undefined) {
+      const current = await currentSelections(state, signal);
+      if (current.incomplete || current.binding !== input.expectSelections)
+        throw new BrowserActionError(
+          'browser_target_changed',
+          current.incomplete ?? 'The current selections changed.',
+        );
+    }
     const dialog = input.action === 'accept_dialog' ? await openDialog(state, signal) : undefined;
     const at = dialog
       ? await dialogPageUrl(state, signal).catch(() => '')
@@ -1814,13 +1969,19 @@ export function createAgentBrowserComputer(options: {
     }
   }
 
-  async function currentPage(id: string, step?: BrowserAction): Promise<BrowserPage> {
+  async function currentPage(
+    id: string,
+    step?: BrowserAction,
+    signal?: AbortSignal,
+  ): Promise<BrowserPage> {
+    signal?.throwIfAborted();
     const state = await recoverBrowser(id);
     if (state?.saved.navigationFailed || (!state && (await screens.load(id))?.navigationFailed))
       throw new BrowserActionError('browser_navigation_failed');
     if (!state?.started) throw new Error('Open the login page in this task browser first.');
     if (state.injecting) throw new BrowserLockedError();
     return serialize(state, async () => {
+      signal?.throwIfAborted();
       if (state.injecting) throw new BrowserLockedError();
       if (await privateDocumentOpen(state)) throw new BrowserLockedError();
       const dialog = step?.action === 'accept_dialog' ? await openDialog(state) : undefined;
@@ -1832,11 +1993,22 @@ export function createAgentBrowserComputer(options: {
         url,
         dialog?.message.slice(0, 2000),
       );
-      if (dialog) return { ...page, dialog: dialog.message.slice(0, 2000), target };
+      if (dialog)
+        return {
+          ...page,
+          dialog: dialog.message.slice(0, 2000),
+          target,
+          currentSelections: {
+            values: [],
+            incomplete:
+              'The browser cannot read current selections while a JavaScript dialog is open.',
+          },
+        };
       const submits = details && 'rawSubmits' in details ? details.rawSubmits : undefined;
       return {
         ...page,
         target,
+        currentSelections: await currentSelections(state, signal),
         ...(details?.controls ? { controls: details.controls } : {}),
         ...(submits
           ? {
@@ -1875,17 +2047,27 @@ export function createAgentBrowserComputer(options: {
         const document = await checkout(state, devtools);
         const controls = new Map<string, BoundSignInControl>();
         const choices: { id: string; label: string; page: BrowserPage }[] = [];
-        for (const method of methods) {
+        for (const [index, method] of methods.entries()) {
           signal?.throwIfAborted();
           const target = selector(method.selector);
           const ref = referenceOf(target);
           const observed = ref ? state.refs.get(ref) : undefined;
           if (ref && !observed) throw new BrowserActionError('browser_target_changed');
-          const control = await devtools.signInControl(
-            ref ? await pointOf(state, ref) : { selector: target },
+          const refused = () =>
+            new BrowserActionError(
+              'browser_sign_in_choice',
+              `Choice ${index + 1} of ${methods.length}.`,
+            );
+          const control = await (async () =>
+            devtools.signInControl(ref ? await pointOf(state, ref) : { selector: target }))().catch(
+            (error: unknown) => {
+              throw error instanceof BrowserActionError && error.code === 'browser_sign_in_choice'
+                ? refused()
+                : error;
+            },
           );
+          if (control.origin !== origin) throw refused();
           if (
-            control.origin !== origin ||
             [...controls.values()].some(
               (previous) => previous.backendNodeId === control.backendNodeId,
             )
