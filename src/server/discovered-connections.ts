@@ -1808,19 +1808,21 @@ export async function createDiscoveredConnections(
           : undefined;
       const address = apps.get(row.service)?.instancePath && !row.paths.length;
       const localAddress = address ? await nearby(row.service) : undefined;
+      const catalogApp = Boolean(
+        apps.get(row.service) &&
+        (address ||
+          row.paths.every((path) => {
+            const app = apps.get(row.service)!;
+            if (app.instancePath) return path.kind === 'mcp';
+            const { id: _id, local: _local, ...saved } = path;
+            return isDeepStrictEqual(saved, appAccessPath(app));
+          })),
+      );
       return reply.header('Cache-Control', 'no-store').send({
         service: row.service,
         name: row.name,
-        catalogApp: Boolean(
-          apps.get(row.service) &&
-          (address ||
-            row.paths.every((path) => {
-              const app = apps.get(row.service)!;
-              if (app.instancePath) return path.kind === 'mcp';
-              const { id: _id, local: _local, ...saved } = path;
-              return isDeepStrictEqual(saved, appAccessPath(app));
-            })),
-        ),
+        catalogApp,
+        hints: catalogApp ? apps.get(row.service)?.hints : undefined,
         credentialLabels:
           apps.get(row.service)?.kind === 'cli'
             ? (apps.get(row.service) as Extract<BundledApp, { kind: 'cli' }>).environment
